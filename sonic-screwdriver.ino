@@ -1,4 +1,3 @@
-
 #pragma GCC optimize("-Os")
 
 #include <Arduino.h>
@@ -2699,16 +2698,11 @@ Notes / Safety:
 ================================================================================
 */
 
+
+
 // =================================================================================
 // === THE REST OF THE CODE - THE MAIN RECIPE ======================================
 // =================================================================================
-
-// --- State Management Variables (The Chip's "Memory") ---
-// These variables help the chip remember what it's supposed to be doing from one
-// moment to the next.
-bool effectsActive = false;      // Remembers if the effects are currently ON or OFF.
-byte lastButtonState = HIGH;     // Remembers if the button was pressed or not on the very last loop.
-
 
 // The setup() function is the first part of our recipe.
 // It runs only ONCE, when the chip first gets power. Its job is to get things ready.
@@ -2757,13 +2751,15 @@ void turnEffectsOff() {
   pinMode(SCL_PIN, INPUT);
 }
 
+byte lastButtonState = HIGH; // Remembers if the button was pressed or not on the very last loop.
+
 // The loop() function is the main part of our recipe.
 // After setup() is finished, the chip runs this code over and over and over,
 // thousands of times per second, forever!
 void loop() {
 
     // --- Step 1: Edge detection ---
-    bool currentButtonState = digitalRead(SWITCH_PIN);
+    byte currentButtonState = digitalRead(SWITCH_PIN);
     bool pressed  = (currentButtonState == LOW && lastButtonState != LOW);
     bool released = (currentButtonState != LOW && lastButtonState == LOW);
 
@@ -2772,19 +2768,17 @@ void loop() {
   // This is called "edge detection". It checks for the *exact moment* you press the button.
   // It's only true if the button is LOW now, AND it was HIGH on the last loop.
   if (pressed) {
-    effectsActive = true;       // We "remember" that the effects should be ON.
     effectStartTime = millis(); // We record this exact moment as our start time.
     turnEffectsOn();
   }
 
   // This checks for the *exact moment* you release the button.
   if (released) {
-    effectsActive = false; // We "remember" that the effects should be OFF.
     turnEffectsOff();    // We call our special function to turn everything off and clean up.
   }
 
   // --- Step 3: Run the effects (if they are supposed to be on) ---
-  if (effectsActive) {
+  if (currentButtonState == LOW) {
 
     // This is the core of our project! If the effects are active, we run the
     // functions that update the light and sound. Because this loop runs thousands
