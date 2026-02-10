@@ -901,14 +901,14 @@ void SSD1306_set_cursor(uint8_t page, uint8_t col) {
  * @details Writes 0x00 to all pages/columns.
  */
 void SSD1306_Clear(void) {
-    for (uint8_t page = 0; page < 8; page++) {
+    for (uint8_t page = 0; page < SSD1306_HEIGHT / 8; page++) {
         SSD1306_set_cursor(page, 0);
 
         // We need to write 128 bytes
         I2C_Start(SSD1306_I2C_ADDR, false);
         I2C_Transmit(SSD1306_CTRL_DATA); // Data Mode
 
-        for (uint8_t i = 0; i < 128; i++)
+        for (uint8_t i = 0; i < SSD1306_WIDTH; i++)
             I2C_Transmit(0x00);
 
         I2C_Stop();  // Send the packet to flush the buffer
@@ -961,11 +961,11 @@ void SSD1306_Clear(void) {
  * Storing only 91 bytes saves 270 bytes of Flash memory.
  */
 static const int8_t sin_LUT[] PROGMEM = {
-    0, 2, 4, 6, 8, 11, 13, 15, 17, 19, 22, 24, 26, 28, 31, 33, 35, 37, 39, 41,
-    43, 45, 47, 50, 52, 54, 55, 57, 59, 61, 63, 65, 67, 69, 71, 72, 74, 76, 78, 79,
-    81, 83, 85, 86, 88, 89, 91, 92, 94, 95, 97, 98, 99, 101, 102, 103, 105, 106, 107, 108,
-    110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 119, 120, 121, 122, 122, 123, 124, 124, 125, 125,
-    126, 126, 126, 127, 127, 127, 127, 127, 127, 127, 127
+	0, 2, 4, 7, 9, 11, 13, 15, 18, 20, 22, 24, 26, 29, 31, 33, 35, 37, 39, 41,
+	43, 46, 48, 50, 52, 54, 56, 58, 60, 62, 64, 65, 67, 69, 71, 73, 75, 76, 78, 80,
+	82, 83, 85, 87, 88, 90, 91, 93, 94, 96, 97, 99, 100, 101, 103, 104, 105, 107, 108, 109,
+	110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 119, 120, 121, 121, 122, 123, 123, 124, 124, 125,
+	125, 125, 126, 126, 126, 127, 127, 127, 127, 127,
 };
 
 /**
@@ -2145,7 +2145,7 @@ int16_t BME280_ReadTemp(void) {
 
     t_fine = var1 + var2; // t_fine carries the fine resolution temp for Pressure calc
 
-    T = (t_fine * 5 + 128) >> 8;
+    T = (t_fine * 5 + SSD1306_WIDTH) >> 8;
 
     return (int16_t)T; // Returns temperature in degC * 100
 }
@@ -2228,118 +2228,6 @@ uint16_t BME280_ReadHumidity(void) {
     return (uint16_t)final_h; // Returns 0 to 10000
 }
 
-////////////////////////////
-
-// Fresh: > 2.9V
-// Nominal: 2.8V
-// Weak: 2.6V (OLED might dim/flicker)
-// Dead: < 2.4V (Brown-out reset likely)
-
-// Measure Supply Voltage in millivolts (e.g., 3000 = 3.0V)
-uint16_t get_battery_mv() {
-    // 1. Configure ADMUX
-    // REFS[2:0] = 000 (VCC used as Reference)
-    // MUX[3:0]  = 1100 (Measure Internal 1.1V Bandgap)
-    ADMUX = (0 << REFS1) | (0 << REFS0) | (1 << MUX3) | (1 << MUX2);
-
-    // 2. Enable ADC + Set Prescaler to 64 (125kHz @ 8MHz)
-    // ADCSRA = Enable | Start | Prescaler
-    ADCSRA = (1 << ADEN) | (1 << ADPS2) | (1 << ADPS1);
-
-    // 3. Stabilization Delay
-    // The bandgap takes a moment to stabilize.
-    // We can just burn a dummy reading.
-    ADCSRA |= (1 << ADSC); // Start first conversion
-    while (ADCSRA & (1 << ADSC)); // Wait
-
-    // 4. Real Measurement
-    ADCSRA |= (1 << ADSC); // Start second conversion
-    while (ADCSRA & (1 << ADSC)); // Wait
-
-    // 5. Calculate VCC
-    // Formula: VCC = (1.1V * 1024) / ADC_Value
-    // Using 1100mV * 1024 = 1126400
-    // Note: The Bandgap varies slightly chip-to-chip (1.0V - 1.2V).
-    // Calibration Constant: 1126400L (Default)
-    uint16_t adc_val = ADC;
-
-    // Disable ADC to save power immediately
-    ADCSRA &= ~(1 << ADEN);
-
-    if (adc_val == 0) return 0; // Prevent divide by zero
-    return (uint16_t)(1126400L / adc_val);
-}
-
-////////////////////////////
-
-int angle;
-struct QMC5883P_data qmc_data;
-
-void loopUI() {
-    if (QMC5883P_read(&qmc_data)) {
-        int16_t heading_deg = atan2_deg(qmc_data.y, qmc_data.x);
-
-        // OLED_set_cursor(0, 40);
-        // OLED_print_uint(heading_deg);
-
-        OLED_set_cursor(0, 14);
-        OLED_string("X");
-        OLED_print_int(qmc_data.x, 4);
-        OLED_string("mG");
-
-        OLED_set_cursor(1, 14);
-        OLED_string("Y");
-        OLED_print_int(qmc_data.y, 4);
-        OLED_string("mG");
-
-        OLED_set_cursor(2, 14);
-        OLED_string("Z");
-        OLED_print_int(qmc_data.z, 4);
-        OLED_string("mG");
-
-        char strbuf[10];
-        OLED_sprint_uint(strbuf, heading_deg, 3);
-        OLED_print_big(1, 6, strbuf);
-        OLED_print_big(1, 6 + 3 * 2, "\x7f"); //  above is 3 double cell wide
-
-        OLED_draw_compass(0, 0, -heading_deg);
-    }
-
-    int16_t temp = BME280_ReadTemp();
-    OLED_set_cursor(4, 0);
-    OLED_string("Temp:");
-    OLED_print_int(temp / 100, 4);
-    OLED_string(".");
-    OLED_print_int(temp % 100, 2);
-    OLED_string(" \x7f" "C"); // split ° and C
-
-#if 1
-    uint32_t p_pa = BME280_ReadPressure(); // e.g. 101325 (Pa)
-    OLED_set_cursor(5, 0);
-    OLED_string("Baro:");
-    OLED_print_int(p_pa / 100, 4);
-    OLED_string(".");
-    OLED_print_int(p_pa % 100, 2);
-    OLED_string(" hPa");
-
-    int16_t hum = BME280_ReadHumidity();
-    OLED_set_cursor(6, 0);
-    OLED_string("Hum :");
-    OLED_print_int(hum / 100, 4);
-    OLED_string(".");
-    OLED_print_int(hum % 100, 2);
-    OLED_string(" %");
-
-    int16_t bat = Battery_GetVoltage();
-    OLED_set_cursor(7, 0);
-    OLED_string("Bat :");
-    OLED_print_int(bat / 1000, 3);
-    OLED_string(".");
-    OLED_print_int(bat % 1000, 3);
-    OLED_string(" V");
-  #endif
-}
-
 /*
  * =============================================================================
  *                    ATTiny85 sleep/standby for low power consumption
@@ -2404,11 +2292,11 @@ void go_to_sleep(void) {
   GIMSK |= (1 << PCIE);                 // Enable pin change interrupts globally
   set_sleep_mode(SLEEP_MODE_PWR_DOWN);  // lowest power mode
   sleep_enable();                       // allow sleep
-  sleep_bod_disable();
+  sleep_bod_disable();			// disable brown-out detection
   sei();                                // ensure interrupts enabled
   sleep_cpu();                          // MCU sleeps here
   sleep_disable();                      // resumes here after wake
-  PCMSK &= ~(1 << PCINT1);               // Disable PCINT1
+  PCMSK &= ~(1 << PCINT1);              // Disable PCINT1
 }
 
 // =================================================================================
@@ -2459,12 +2347,12 @@ const byte SCL_PIN = PB2;         // chip pin 7
 // --- EFFECT "SEASONING" ---
 // These are the fun numbers you can change to be a "sound designer"!
 // Try changing them and see what happens to the final effect.
-int   throbSpeed      = 7;  // How fast the LED fades. Try 2.0 (slow) or 10.0 (fast)!
-int   startFrequency  = 800; // The starting pitch of the sound (in Hertz).
-int   endFrequency    = 1800;// The ending pitch of the sound.
-int   sweepDuration   = 700; // How many milliseconds the sound takes to slide up.
-int   warbleDepth     = 30;  // How "wobbly" the sound is. Try 10 for subtle, 100 for crazy!
-int   warbleSpeed     = 25;  // How fast the wobble is. Lower numbers are faster!
+int   mSecPerCycle    = 500; // How fast the LED cycles
+int   startFrequency  = 800;  // The starting pitch of the sound (in Hertz).
+int   endFrequency    = 1800; // The ending pitch of the sound.
+int   sweepDuration   = 700;  // How many milliseconds the sound takes to slide up.
+int   warbleDepth     = 30;   // How "wobbly" the sound is. Try 10 for subtle, 100 for crazy!
+int   warbleSpeed     = 25;   // How fast the wobble is. Lower numbers are faster!
 
 /*
  * =========================================================================================
@@ -2646,13 +2534,8 @@ void sonic_noTone(void)
     sei();
 }
 
-unsigned long effectStartTime = 0; // Remembers the exact moment (in milliseconds) the effects were turned on.
-
 // This function creates the Doctor Who WARBLE sound.
-void updateSonicWarble() {
-
-	// Get the current time since the button was pressed.
-	long timeSinceStart = millis() - effectStartTime;
+void updateSonicWarble(long timeSinceStart) {
 
 	// --- Create SONG #1: The Sweep ---+
 	long baseFrequency;
@@ -2673,23 +2556,84 @@ void updateSonicWarble() {
 	sonic_tone(baseFrequency + warble);
 }
 
+/*
+ * =========================================================================================
+ * LED subsystem
+ * =========================================================================================
+ */
+
+// --- Globals ---
+// This is the bucket the main loop throws data into.
+volatile uint8_t brightness = 0;
+
+// Track the phase: 0 = Pulse Active (Low), 1 = Pulse Inactive (High)
+volatile uint8_t pwm_phase = 0;
+
+// --- Logic ---
+
+void led_Init() {
+  // 2. Default State: HIGH (LED OFF for Active Low)
+  PORTB |= (1 << PB1);
+
+  // 3. Enable Timer0 Compare Match B Interrupt
+  // We keep this running forever to ensure seamless transitions.
+  TIMSK |= (1 << OCIE0B);
+
+  // 4. Initial Trigger
+  OCR0B = 128;
+}
+
+// --- The Single ISR ---
+
+ISR(TIMER0_COMPB_vect) {
+  // We use a static variable to hold the brightness stable
+  // for the duration of a full ON/OFF cycle.
+  static uint8_t latched_duty = 0;
+
+  if (pwm_phase == 0) {
+    // =========================================================
+    // END OF "ON" PHASE -> STARTING "OFF" PHASE
+    // =========================================================
+
+    // 1. Turn LED OFF (Set HIGH for Active Low)
+    // (Always perform this safety set to ensure clean edges)
+    PORTB |= (1 << PB1);
+
+    // 2. Calculate time to stay OFF
+    // We want to fill the rest of the 255-tick window.
+    // Note: We use the duty we latched at the START of the cycle.
+    OCR0B = 255 - latched_duty;
+
+    // 3. Switch Phase
+    pwm_phase = 1;
+
+  } else {
+    // =========================================================
+    // END OF "OFF" PHASE -> STARTING "ON" PHASE
+    // =========================================================
+
+    // 1. LATCH NEW DATA
+    // This is the safe moment to accept a new value from the main loop.
+    latched_duty = brightness;
+
+    // 2. Turn LED ON (Set LOW for Active Low)
+    // Only if brightness is > 0 (otherwise stay OFF)
+    if (latched_duty > 0) {
+      PORTB &= ~(1 << PB1);
+    }
+
+    // 3. Calculate time to stay ON
+    OCR0B = latched_duty;
+
+    // 4. Switch Phase
+    pwm_phase = 0;
+  }
+}
+
 // This function creates the smooth THROB effect for the LED.
-void updateLedThrob() {
-#if 0
-  float elapsedTime = (millis() - effectStartTime) / 1000.0;
-  float sinValue = sin(elapsedTime * throbSpeed);
-  int brightness = (int)(((sinValue + 1.0) / 2.0) * 255);
-#else
-  unsigned long elapsedMillis = millis() - effectStartTime;
-  int deg = (int) (elapsedMillis * throbSpeed);
-  int brightness = sin_deg(deg) + 127;  // returns -127..127
-#endif
-
-
-//  analogWrite(LED_PIN, brightness);
-// TCCR1 = _BV(PWM1A) | _BV(CS10);
-// GTCCR = _BV(COM1A1);
-// OCR1A = brightness;
+void updateLedThrob(long timeSinceStart) {
+  long angle = (timeSinceStart * 360) / mSecPerCycle;
+  brightness = sin_deg(angle + 270) + 127;  // returns -127..127
 }
 
 /*
@@ -2770,7 +2714,75 @@ Notes / Safety:
 ================================================================================
 */
 
+// =================================================================================
+// === Screen handler
+// =================================================================================
 
+void loopUI() {
+  struct QMC5883P_data qmc_data;
+  if (QMC5883P_read(&qmc_data)) {
+    int16_t heading_deg = atan2_deg(qmc_data.y, qmc_data.x);
+
+    // OLED_set_cursor(0, 40);
+    // OLED_print_uint(heading_deg);
+
+    OLED_set_cursor(0, 14);
+    OLED_string("X");
+    OLED_print_int(qmc_data.x, 4);
+    OLED_string("mG");
+
+    OLED_set_cursor(1, 14);
+    OLED_string("Y");
+    OLED_print_int(qmc_data.y, 4);
+    OLED_string("mG");
+
+    OLED_set_cursor(2, 14);
+    OLED_string("Z");
+    OLED_print_int(qmc_data.z, 4);
+    OLED_string("mG");
+
+    char strbuf[10];
+    OLED_sprint_uint(strbuf, heading_deg, 3);
+    OLED_print_big(1, 6, strbuf);
+    OLED_print_big(1, 6 + 3 * 2, "\x7f"); //  above is 3 double cell wide
+
+    OLED_draw_compass(0, 0, -heading_deg);
+  }
+
+  int16_t temp = BME280_ReadTemp();
+  OLED_set_cursor(4, 0);
+  OLED_string("Temp:");
+  OLED_print_int(temp / 100, 4);
+  OLED_string(".");
+  OLED_print_int(temp % 100, 2);
+  OLED_string(" \x7f" "C"); // split ° and C
+
+#if 1
+  uint32_t p_pa = BME280_ReadPressure(); // e.g. 101325 (Pa)
+  OLED_set_cursor(5, 0);
+  OLED_string("Baro:");
+  OLED_print_int(p_pa / 100, 4);
+  OLED_string(".");
+  OLED_print_int(p_pa % 100, 2);
+  OLED_string(" hPa");
+
+  int16_t hum = BME280_ReadHumidity();
+  OLED_set_cursor(6, 0);
+  OLED_string("Hum :");
+  OLED_print_int(hum / 100, 4);
+  OLED_string(".");
+  OLED_print_int(hum % 100, 2);
+  OLED_string(" %");
+
+  int16_t bat = Battery_GetVoltage();
+  OLED_set_cursor(7, 0);
+  OLED_string("Bat :");
+  OLED_print_int(bat / 1000, 3);
+  OLED_string(".");
+  OLED_print_int(bat % 1000, 3);
+  OLED_string(" V");
+#endif
+}
 
 // =================================================================================
 // === THE REST OF THE CODE - THE MAIN RECIPE ======================================
@@ -2779,32 +2791,33 @@ Notes / Safety:
 // The setup() function is the first part of our recipe.
 // It runs only ONCE, when the chip first gets power. Its job is to get things ready.
 void setup() {
-      I2C_Init();         // Set SDA/SCL to Float/High-Z ONCE
+  I2C_Init(); // Set SDA/SCL to Float/High-Z ONCE
 
-    // 2. Hardware Stabilization
-    // Give voltage time to stabilize before talking to chips
-    _delay_ms(50);
+  // 2. Hardware Stabilization
+  // Give voltage time to stabilize before talking to chips
+  _delay_ms(50);
 }
 
 // This function is called when you press the button. Its job is to activate the sonic screwdriver
 void turnEffectsOn() {
-    // Now we perform our "just-in-time" pin configuration.
-    // Only at the moment the button is pressed do we take control of the special pins.
-    pinMode(PIEZO_PLUS_PIN, OUTPUT);
-    pinMode(PIEZO_MINUS_PIN, OUTPUT);
-    pinMode(LED_PIN, OUTPUT); // Make sure SWITCH/LED is set to LED
-    pinMode(SDA_PIN, OUTPUT);
-    pinMode(SCL_PIN, OUTPUT);
+  // Now we perform our "just-in-time" pin configuration.
+  // Only at the moment the button is pressed do we take control of the special pins.
+  pinMode(PIEZO_PLUS_PIN, OUTPUT);
+  pinMode(PIEZO_MINUS_PIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT); // Make sure SWITCH/LED is set to LED
+  pinMode(SDA_PIN, OUTPUT);
+  pinMode(SCL_PIN, OUTPUT);
 
-    // 3. Device Init
-    SSD1306_Init();  // Configure Screen
-    QMC5883P_Init(); // Configure Compass
-    BME280_Init();   // Configure Sensor
-    sonic_Init();
+  // 3. Device Init
+  SSD1306_Init();  // Configure Screen
+  QMC5883P_Init(); // Configure Compass
+  BME280_Init();   // Configure Sensor
+  sonic_Init();
+  led_Init();
 
-    // 4. Initial Screen Draw
-    SSD1306_Clear();
-    SSD1306_Wake();
+  // 4. Initial Screen Draw
+  SSD1306_Clear();
+  SSD1306_Wake();
 }
 
 // This function is called when you release the button. Its job is to deactivate the sonic screwdriver
@@ -2823,8 +2836,9 @@ void turnEffectsOff() {
   pinMode(SCL_PIN, INPUT);
 }
 
+unsigned long soundStartTime; // Remembers the exact moment (in milliseconds) the effects were turned on.
+unsigned long lightStartTime; // Remembers the exact moment (in milliseconds) the effects were turned on.
 byte lastButtonState = HIGH; // Remembers if the button was pressed or not on the very last loop.
-long ledTimer;
 
 // The loop() function is the main part of our recipe.
 // After setup() is finished, the chip runs this code over and over and over,
@@ -2840,20 +2854,17 @@ void loop() {
     // device if ON and pin6 is configured for LED
     currentButtonState = LOW;
 
-    long duration = (long) (millis() - ledTimer); // cast to long because difference is a signed delta
-    if (duration >= 0 && duration < 1000) {
-      // update LED state and assume switch pressed
-      if (duration < 500)
-	digitalWrite(LED_PIN, LOW);
-      else
-	digitalWrite(LED_PIN, HIGH);
-    } else {
+    // if cycle is complete as to sense switch
+    long duration = (long) (millis() - lightStartTime); // cast to long because difference is a signed delta
+    if (duration >= mSecPerCycle) {
       // LED finished cycle, switch can be sampled
       pinMode(LED_PIN, INPUT); // change to switch
-        _delay_us(20); // stabilize
+      _delay_us(20); // stabilize
       currentButtonState = digitalRead(SWITCH_PIN);
       pinMode(LED_PIN, OUTPUT); // change to LED
-      ledTimer = millis();
+
+      // next cycle
+      lightStartTime += mSecPerCycle;
     }
   }
 
@@ -2866,7 +2877,7 @@ void loop() {
   // This is called "edge detection". It checks for the *exact moment* you press the button.
   // It's only true if the button is LOW now, AND it was HIGH on the last loop.
   if (pressed) {
-    ledTimer = effectStartTime = millis(); // We record this exact moment as our start time.
+    lightStartTime = soundStartTime = millis(); // We record this exact moment as our start time.
     turnEffectsOn(); // turn everything on
   }
 
@@ -2881,13 +2892,12 @@ void loop() {
 
   // --- Step 3: Run the effects (if they are supposed to be on) ---
   if (currentButtonState == LOW) {
-
     // This is the core of our project! If the effects are active, we run the
     // functions that update the light and sound. Because this loop runs thousands
     // of times per second, we are giving the light and sound a tiny update
     // on each pass, creating the illusion of a smooth, continuous effect.
-    updateLedThrob();      // ...run the smooth throb function.
-    updateSonicWarble(); // The sound function runs in either mode.
+    updateLedThrob((long) (millis() - lightStartTime));    // ...run the smooth throb function.
+    updateSonicWarble((long) (millis() - soundStartTime)); // The sound function runs in either mode.
 
     loopUI();
   }
