@@ -2451,7 +2451,7 @@ Notes:
 
 const byte PIEZO_PLUS_PIN = PB3;  // chip pin 2
 const byte PIEZO_MINUS_PIN = PB4; // chip pin 3
-const byte LED_PIN = 3;           // chip pin 5
+const byte LED_PIN = PB1;         // chip pin 6
 const byte SWITCH_PIN = PB1;      // chip pin 6
 const byte SDA_PIN = PB0;         // chip pin 5
 const byte SCL_PIN = PB2;         // chip pin 7
@@ -2686,8 +2686,7 @@ void updateLedThrob() {
 #endif
 
 
-  analogWrite(LED_PIN, brightness);
-
+//  analogWrite(LED_PIN, brightness);
 // TCCR1 = _BV(PWM1A) | _BV(CS10);
 // GTCCR = _BV(COM1A1);
 // OCR1A = brightness;
@@ -2793,7 +2792,7 @@ void turnEffectsOn() {
     // Only at the moment the button is pressed do we take control of the special pins.
     pinMode(PIEZO_PLUS_PIN, OUTPUT);
     pinMode(PIEZO_MINUS_PIN, OUTPUT);
-    pinMode(LED_PIN, OUTPUT);
+    pinMode(LED_PIN, OUTPUT); // Make sure SWITCH/LED is set to LED
     pinMode(SDA_PIN, OUTPUT);
     pinMode(SCL_PIN, OUTPUT);
 
@@ -2812,36 +2811,62 @@ void turnEffectsOn() {
 void turnEffectsOff() {
   SSD1306_Sleep();
   sonic_noTone(); // sound off
-  digitalWrite(LED_PIN, LOW); // led off
+  digitalWrite(LED_PIN, HIGH); // led off
 
   // This is the most critical part for making our project programmable.
   // We release our control of the special programming pins, making them "safe"
   // and ready for the next time you want to upload code.
   pinMode(PIEZO_PLUS_PIN, INPUT);
   pinMode(PIEZO_MINUS_PIN, INPUT);
-  pinMode(LED_PIN, INPUT);
+  pinMode(LED_PIN, INPUT); // Make sure SWITCH/LED is set to switch
   pinMode(SDA_PIN, INPUT);
   pinMode(SCL_PIN, INPUT);
 }
 
 byte lastButtonState = HIGH; // Remembers if the button was pressed or not on the very last loop.
+long ledTimer;
 
 // The loop() function is the main part of our recipe.
 // After setup() is finished, the chip runs this code over and over and over,
 // thousands of times per second, forever!
 void loop() {
+  byte currentButtonState;
 
-    // --- Step 1: Edge detection ---
-    byte currentButtonState = digitalRead(SWITCH_PIN);
-    bool pressed  = (currentButtonState == LOW && lastButtonState != LOW);
-    bool released = (currentButtonState != LOW && lastButtonState == LOW);
+  // If the LED is busy with a cycle, finish that first before sensing the button
+  if (lastButtonState == HIGH) {
+    // device if OFF and pin6 is configured for switch
+    currentButtonState = digitalRead(SWITCH_PIN);
+  } else {
+    // device if ON and pin6 is configured for LED
+    currentButtonState = LOW;
 
-    // --- Step 2: Activate or deactivate effects ---
+    long duration = (long) (millis() - ledTimer); // cast to long because difference is a signed delta
+    if (duration >= 0 && duration < 1000) {
+      // update LED state and assume switch pressed
+      if (duration < 500)
+	digitalWrite(LED_PIN, LOW);
+      else
+	digitalWrite(LED_PIN, HIGH);
+    } else {
+      // LED finished cycle, switch can be sampled
+      pinMode(LED_PIN, INPUT); // change to switch
+        _delay_us(20); // stabilize
+      currentButtonState = digitalRead(SWITCH_PIN);
+      pinMode(LED_PIN, OUTPUT); // change to LED
+      ledTimer = millis();
+    }
+  }
+
+  // --- Step 1: Edge detection ---
+  bool pressed  = (currentButtonState == LOW && lastButtonState != LOW);
+  bool released = (currentButtonState != LOW && lastButtonState == LOW);
+
+  // --- Step 2: Activate or deactivate effects ---
 
   // This is called "edge detection". It checks for the *exact moment* you press the button.
   // It's only true if the button is LOW now, AND it was HIGH on the last loop.
   if (pressed) {
-    effectStartTime = millis(); // We record this exact moment as our start time.
+    ledTimer = effectStartTime = millis(); // We record this exact moment as our start time.
     turnEffectsOn(); // turn everything on
   }
 
