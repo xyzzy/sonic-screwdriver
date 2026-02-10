@@ -2377,11 +2377,12 @@ Notes:
 - Dynamic pinMode management allows safe multiplexing between LED, switch, and programming.
 */
 
-const byte SPEAKER_PIN = PB4;  // chip pin 3
-const byte LED_PIN = 3;        // chip pin 5
-const byte SWITCH_PIN = PB1;   // chip pin 6
-const byte SDA_PIN = PB0;      // chip pin 5
-const byte SCL_PIN = PB2;      // chip pin 7
+const byte PIEZO_PLUS_PIN = PB3;  // chip pin 2
+const byte PIEZO_MINUS_PIN = PB4; // chip pin 3
+const byte LED_PIN = 3;           // chip pin 5
+const byte SWITCH_PIN = PB1;      // chip pin 6
+const byte SDA_PIN = PB0;         // chip pin 5
+const byte SCL_PIN = PB2;         // chip pin 7
 
 // --- EFFECT "SEASONING" ---
 // These are the fun numbers you can change to be a "sound designer"!
@@ -2469,6 +2470,110 @@ int   warbleSpeed     = 25;  // How fast the wobble is. Lower numbers are faster
 //
 // =================================================================================
 
+ISR(TIMER1_COMPA_vect)
+{
+    if (PORTB & (1<<PIEZO_MINUS_PIN)) {
+        // PB4 low, PB3 high
+        PORTB = (PORTB & ~(1<<PIEZO_MINUS_PIN)) | (1<<PIEZO_PLUS_PIN);
+    } else {
+        // PB4 high, PB3 low
+        PORTB = (PORTB & ~(1<<PIEZO_PLUS_PIN)) | (1<<PIEZO_MINUS_PIN);
+    }
+}
+
+void sonic_Init()
+{
+  cli();
+
+  /* --- GPIO setup --- */
+  DDRB |= (1 << PIEZO_PLUS_PIN) | (1 << PIEZO_MINUS_PIN);
+
+  // Start in opposite phase
+  PORTB |=  (1 << PIEZO_MINUS_PIN);
+  PORTB &= ~(1 << PIEZO_PLUS_PIN);
+
+  /* --- Stop Timer1 --- */
+  TCCR1 = 0;
+  GTCCR = 0;
+  TCNT1 = 0;
+
+  /* --- CTC mode --- */
+  TCCR1 = (1 << CTC1);
+
+  /* --- Hardware toggle on PB4 (OC1B) --- */
+  // remove because it is now software driven
+  // GTCCR |= (1 << COM1B0);
+
+  /* Clear stale compare flag before enabling ISR */
+  TIFR |= (1 << OCF1A);
+
+  /* --- Enable ISR for PB3 toggle --- */
+  TIMSK |= (1 << OCIE1A);
+
+  sei();
+}
+
+void sonic_tone(uint16_t freq)
+{
+    if (freq == 0) return;
+
+    cli();
+
+    /* --- Frequency calculation --- */
+    uint32_t ocr = (uint32_t)F_CPU / (freq * 2);
+    uint8_t prescaler = 0b0001;   // clk/1
+
+    while (ocr > 0xFF && prescaler < 15) {
+        prescaler++;
+        ocr >>= 1;
+    }
+
+    // 1. Reset Counter.
+    // Crucial to restart the wave phase from 0 immediately.
+    TCNT1 = 0;
+
+    // 2. Set Match Value
+    OCR1C = (uint8_t)(ocr - 1);   // TOP
+    OCR1A = OCR1C;                // Compare A @ TOP
+
+    // 3. Clear any pending interrupt flags from previous tones.
+    // If we don't do this, an old flag might fire the ISR immediately
+    // with the wrong timing.
+    TIFR |= (1 << OCF1A);
+
+    /* --- Start Timer --- */
+    // We combine CTC1 mode and Prescaler in one write.
+    // This overwrites the previous state, effectively starting the timer.
+    TCCR1 = (1 << CTC1) | (prescaler);
+
+    sei();
+}
+
+void sonic_noTone(void)
+{
+    cli();
+
+    /* --- Disable interrupt first --- */
+    TIMSK &= ~(1 << OCIE1A);
+
+    /* --- Stop Timer1 clock --- */
+    TCCR1 = 0; // &= ~0x0F;   // clear CS13..CS10
+
+    /* --- Disconnect all timer outputs (safety) --- */
+    GTCCR = 0;
+
+    /* Clear pending flags */
+    TIFR |= (1 << OCF1A);
+
+    /* --- Reset counter (optional but clean) --- */
+    TCNT1 = 0;
+
+    /* --- Drive outputs low --- */
+    PORTB &= ~((1 << PIEZO_PLUS_PIN) | (1 << PIEZO_MINUS_PIN));
+
+    sei();
+}
+
 unsigned long effectStartTime = 0; // Remembers the exact moment (in milliseconds) the effects were turned on.
 
 // This function creates the Doctor Who WARBLE sound.
@@ -2493,7 +2598,7 @@ void updateSonicWarble() {
 
 	// --- THE FINAL PERFORMANCE ---
 	// Add the two songs together and tell the 'musician' to play the new note.
-	tone(SPEAKER_PIN, baseFrequency + warble);
+	sonic_tone(baseFrequency + warble);
 }
 
 // This function creates the smooth THROB effect for the LED.
@@ -2594,9 +2699,6 @@ Notes / Safety:
 ================================================================================
 */
 
-
-
-
 // =================================================================================
 // === THE REST OF THE CODE - THE MAIN RECIPE ======================================
 // =================================================================================
@@ -2616,23 +2718,14 @@ void setup() {
     // 2. Hardware Stabilization
     // Give voltage time to stabilize before talking to chips
     _delay_ms(50);
-
-    // // 3. Device Init
-    // SSD1306_Init();        // Configure Screen
-    // QMC5883P_Init();     // Configure Sensor
-    // BME280_Init();
-
-    // // 4. Initial Screen Draw
-    // SSD1306_Clear();
-    // SSD1306_Wake();
-
 }
 
 // This function is called when you press the button. Its job is to activate the sonic screwdriver
 void turnEffectsOn() {
     // Now we perform our "just-in-time" pin configuration.
     // Only at the moment the button is pressed do we take control of the special pins.
-    pinMode(SPEAKER_PIN, OUTPUT);
+    pinMode(PIEZO_PLUS_PIN, OUTPUT);
+    pinMode(PIEZO_MINUS_PIN, OUTPUT);
     pinMode(LED_PIN, OUTPUT);
     pinMode(SDA_PIN, OUTPUT);
     pinMode(SCL_PIN, OUTPUT);
@@ -2641,6 +2734,7 @@ void turnEffectsOn() {
     SSD1306_Init();  // Configure Screen
     QMC5883P_Init(); // Configure Compass
     BME280_Init();   // Configure Sensor
+    sonic_Init();
 
     // 4. Initial Screen Draw
     SSD1306_Clear();
@@ -2650,13 +2744,14 @@ void turnEffectsOn() {
 // This function is called when you release the button. Its job is to deactivate the sonic screwdriver
 void turnEffectsOff() {
   SSD1306_Sleep();
-  noTone(SPEAKER_PIN); // sound off
+  sonic_noTone(); // sound off
   digitalWrite(LED_PIN, LOW); // led off
 
   // This is the most critical part for making our project programmable.
   // We release our control of the special programming pins, making them "safe"
   // and ready for the next time you want to upload code.
-  pinMode(SPEAKER_PIN, INPUT);
+  pinMode(PIEZO_PLUS_PIN, INPUT);
+  pinMode(PIEZO_MINUS_PIN, INPUT);
   pinMode(LED_PIN, INPUT);
   pinMode(SDA_PIN, INPUT);
   pinMode(SCL_PIN, INPUT);
