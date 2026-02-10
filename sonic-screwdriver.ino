@@ -1,0 +1,2706 @@
+
+#pragma GCC optimize("-Os")
+
+#include <Arduino.h>
+#include <avr/pgmspace.h>
+#include <avr/io.h>
+#include <util/delay.h>
+#include "clion_compat.h"
+
+/*
+ * =========================================================================================
+ * I2C MASTER SUBSYSTEM - BARE METAL BIT-BANG DRIVER
+ * =========================================================================================
+ *
+ * 1. PHYSICAL LAYER & ELECTRICAL CHARACTERISTICS
+ * -----------------------------------------------------------------------------------------
+ * TOPOLOGY: Open-Drain / Open-Collector
+ * - The bus relies on "Active Low" logic.
+ * - Logic 0 (LOW):  The pin is set to OUTPUT and driven to GND.
+ * - Logic 1 (HIGH): The pin is set to INPUT (High-Z / Tri-state).
+ *                   The voltage is pulled to VCC by external resistors.
+ * - CRITICAL: We NEVER drive a hard Logic 1 (VCC) output. This would cause a short circuit
+ *             if a target tries to pull the line Low simultaneously (Clock Stretching/ACK).
+ *
+ * IMPEDANCE & CURRENT CALCULATION:
+ * - Configuration: 1 Master (ATtiny/Uno) + 3 Targets (OLED, BME280, QMC5883P).
+ * - Assumption: Each module contains a ~4.7k Ohm pull-up resistor on SDA/SCL.
+ * - Total Bus Resistance (Parallel):
+ *   R_total = 1 / (1/4700 + 1/4700 + 1/4700 + 1/4700) ~= 1175 Ohms (Worst case with 4 resistors).
+ *   R_total = ~1566 Ohms (Typical if Master has no pull-up).
+ * - Current Sink Requirement (at 3.3V):
+ *   I_sink = VCC / R_total = 3.3V / 1566 Ohms ~= 2.1 mA.
+ * - Safety Margin:
+ *   The ATtiny85 can sink ~20mA per pin. The I2C Standard requires sinking 3mA.
+ *   Result: The setup is electrically safe.
+ * - Internal Pull-ups:
+ *   The MCU's internal pull-ups (~30k) are explicitly DISABLED in software to prevent
+ *   unpredictable impedance changes and reduce phantom current consumption.
+ *
+ * -----------------------------------------------------------------------------------------
+ * 2. PROTOCOL LOGIC: THE "SETUP & SAMPLE" MODEL
+ * -----------------------------------------------------------------------------------------
+ * The state of SDA is dictated by the state of SCL.
+ *
+ * STATE A: SCL IS LOW (The "Setup" Phase)
+ * - The Bus is "Claimed" by the Master.
+ * - SDA is MUTABLE.
+ * - The transmitter (Master during Write, Target during Read) sets the bit value now.
+ * - SDA changes are safe because the receiver is not looking at the line yet.
+ *
+ * STATE B: SCL IS HIGH (The "Sample" Phase)
+ * - SDA is FROZEN.
+ * - The receiver (Target during Write, Master during Read) samples the bit now.
+ * - Rising SCL Edge: Logically marks the start of the bit. Data must be stable.
+ * - Falling SCL Edge: Logically marks the end of the bit.
+ *
+ * EXCEPTION: START & STOP CONDITIONS
+ * - These are the ONLY times SDA is allowed to change while SCL is HIGH.
+ * - START: SDA falls while SCL is High. (Indicates bus is now BUSY).
+ * - STOP:  SDA rises while SCL is High. (Indicates bus is now IDLE).
+ *
+ * -----------------------------------------------------------------------------------------
+ * 3. READ/WRITE SYMMETRY
+ * -----------------------------------------------------------------------------------------
+ * - WRITE BIT: Master asserts SDA (Low/High-Z) -> Toggles SCL High -> Toggles SCL Low.
+ * - READ BIT:  Master releases SDA (High-Z) -> Toggles SCL High -> Senses SDA -> Toggles SCL Low.
+ * - TIMING:    During Read, the Master assumes the Target asserts SDA immediately
+ *              after the previous SCL falling edge (0ns Hold Time per I2C Spec).
+ *              The Master waits one Half-Cycle delay before raising SCL to guarantee
+ *              the Target's signal is stable.
+ *
+ * -----------------------------------------------------------------------------------------
+ * 4. BUS STATES
+ * -----------------------------------------------------------------------------------------
+ * - IDLE: SCL=High, SDA=High (Bus released, pulled up by resistors).
+ * - BUSY: Time between a START and a STOP condition.
+ * - ACK/NACK (9th Bit):
+ *   After 8 data bits, the Transmitter releases SDA (High-Z).
+ *   ACK:  Receiver pulls SDA Low.
+ *   NACK: Receiver leaves SDA High.
+ *
+ * -----------------------------------------------------------------------------------------
+ * 5. TARGET DEVICE MAP
+ * -----------------------------------------------------------------------------------------
+ * - SSD1306 OLED: 0x3C (Write Only)
+ * - BME280 Env:   0x76 (Read/Write, Registers)
+ * - QMC5883P Mag: 0x2C (Read/Write, Registers - Note 'P' variant ID)
+ *
+ * =========================================================================================
+ */
+
+/* =========================================================================
+ *                      HARDWARE ABSTRACTION LAYER
+ * ========================================================================= */
+
+/*
+ * I2C Speed Configuration.
+ * 5.0 us = 100 kHz (Standard Mode)
+ * 1.2 us = 400 kHz (Fast Mode)
+ * 2.0 us = ~250 kHz (Robust Compromise)
+ */
+#define I2C_DELAY_HALF_CYCLE_US  2
+
+#if defined(__AVR_ATtiny85__)
+// ATtiny85: Port B, SDA=PB0, SCL=PB2
+#define I2C_PORT_REG PORTB
+#define I2C_DDR_REG  DDRB
+#define I2C_PIN_REG  PINB
+#define PIN_SDA      PB0
+#define PIN_SCL      PB2
+#else
+// Arduino Uno (ATmega328P): Port C, SDA=PC4, SCL=PC5
+#define I2C_PORT_REG PORTC
+#define I2C_DDR_REG  DDRC
+#define I2C_PIN_REG  PINC
+#define PIN_SDA      PC4
+#define PIN_SCL      PC5
+#endif
+
+// Constants for Bitwise Operations (Rule 10.x compliance)
+// 1U ensures the shift occurs on an unsigned integer
+#define MASK_SDA ((uint8_t)(1U << PIN_SDA))
+#define MASK_SCL ((uint8_t)(1U << PIN_SCL))
+
+// Status Codes
+typedef enum {
+    I2C_STATUS_OK           = 0, // Transaction successful
+    I2C_STATUS_NACK         = 1, // Target returned NACK
+    I2C_STATUS_NULL_PTR     = 3, // User passed NULL pointer
+    I2C_STATUS_INVALID_LEN  = 4, // User requested 0 length
+} I2C_Status_t;
+
+/* =========================================================================
+ *                     PHYSICAL LAYER FUNCTIONS
+ * ========================================================================= */
+
+/**
+ * @brief  Inserts the half-cycle delay required for bit timing.
+ * @details This function isolates the compiler intrinsic `_delay_us` to one location.
+ *          Since it is `static inline`, the compiler will replace calls with
+ *          the actual delay code, avoiding function call overhead.
+ */
+static inline void I2C_Delay(void) {
+    _delay_us(I2C_DELAY_HALF_CYCLE_US);
+}
+
+/**
+ * @brief  Drives the SDA line to Logic 0 (LOW).
+ * @details
+ * - PHYSICAL: Pin configured as OUTPUT. Voltage driven to GND.
+ * - LOGICAL:  Sets Data Direction Register (DDR) bit to 1.
+ *             Sets PORT register bit to 0.
+ */
+static inline void SDA_Low(void) {
+    // Set bit in DDR to make it Output
+    I2C_DDR_REG  = (uint8_t)(I2C_DDR_REG | MASK_SDA);
+    // Clear bit in PORT to drive Low
+    I2C_PORT_REG = (uint8_t)(I2C_PORT_REG & (uint8_t)(~MASK_SDA));
+}
+
+/**
+ * @brief  Releases the SDA line to Logic 1 (HIGH-Z).
+ * @details
+ * - PHYSICAL: Pin configured as INPUT. Voltage floats.
+ *             External resistors pull the line to VCC.
+ * - LOGICAL:  Sets Data Direction Register (DDR) bit to 0.
+ *             CRITICAL: Sets PORT bit to 0 to DISABLE internal MCU pull-up.
+ */
+static inline void SDA_High(void) {
+    // Clear bit in DDR to make it Input (High Impedance)
+    I2C_DDR_REG  = (uint8_t)(I2C_DDR_REG & (uint8_t)(~MASK_SDA));
+    // Clear bit in PORT to DISABLE internal pull-up
+    I2C_PORT_REG = (uint8_t)(I2C_PORT_REG & (uint8_t)(~MASK_SDA));
+}
+
+/**
+ * @brief  Drives the SCL line to Logic 0 (LOW).
+ * @details Sets DDR to Output, PORT to Low.
+ */
+static inline void SCL_Low(void) {
+    // Set bit in DDR to make it Output
+    I2C_DDR_REG  = (uint8_t)(I2C_DDR_REG | MASK_SCL);
+    // Clear bit in PORT to drive Low
+    I2C_PORT_REG = (uint8_t)(I2C_PORT_REG & (uint8_t)(~MASK_SCL));
+}
+
+/**
+ * @brief  Releases the SCL line to Logic 1 (HIGH-Z).
+ * @details Sets DDR to Input, PORT to Low (Disable internal pull-up).
+ */
+static inline void SCL_High(void) {
+    // Clear bit in DDR to make it Input (High Impedance)
+    I2C_DDR_REG  = (uint8_t)(I2C_DDR_REG & (uint8_t)(~MASK_SCL));
+    // Clear bit in PORT to DISABLE internal pull-up
+    I2C_PORT_REG = (uint8_t)(I2C_PORT_REG & (uint8_t)(~MASK_SCL));
+}
+
+/**
+ * @brief  Reads the current logic state of the SDA line.
+ * @return true if Voltage > V_threshold (Logic 1), false otherwise.
+ */
+static inline bool SDA_Read(void) {
+    return ((I2C_PIN_REG & MASK_SDA) != 0);
+}
+
+/* =========================================================================
+ *                     DATA LINK LAYER FUNCTIONS
+ * ========================================================================= */
+
+/**
+ * @brief  Transmits 8 bits to the bus and reads the ACK bit.
+ * @details
+ * Implements the "Setup/Sample" model:
+ * 1. SCL Low  (Setup):  Master changes SDA.
+ * 2. Delay:             Wait for signal to stabilize.
+ * 3. SCL High (Sample): Target reads SDA.
+ * 4. Delay:             Wait for Target hold time.
+ *
+ * @param  byte_val  The byte to transmit (MSB First).
+ * @return true if Target ACKed (pulled SDA Low), false if NACK (SDA High).
+ */
+static bool I2C_Transmit(uint8_t byte_val) {
+    uint8_t mask = 0x80U; // Start with MSB (10000000)
+
+    for (uint8_t i = 0; i < 8U; i++) {
+        // --- SETUP PHASE ---
+        // SCL is currently Low. We are allowed to change SDA.
+        if ((byte_val & mask) != 0)
+            SDA_High(); // Send '1'
+        else
+            SDA_Low();  // Send '0'
+
+        // Wait for signal rise/fall time
+        I2C_Delay();
+
+        // --- SAMPLE PHASE ---
+        // Drive SCL High. Target samples the bit now.
+        SCL_High();
+        I2C_Delay(); // Hold the clock High
+
+        // --- END PHASE ---
+        // Drive SCL Low. Target prepares for next bit.
+        SCL_Low();
+
+        mask = (uint8_t)(mask >> 1U); // Shift mask to next bit
+    }
+
+    // --- ACKNOWLEDGE PHASE (9th Bit) ---
+    // 1. Master releases SDA (High-Z) to let Target control it.
+    SDA_High();
+    I2C_Delay();
+
+    // 2. Master pulses SCL High to read the ACK.
+    SCL_High();
+    I2C_Delay();
+
+    // 3. Master reads SDA.
+    // Logic 0 = ACK (Target pulled low). Logic 1 = NACK (Target did nothing).
+    bool ack_received = !SDA_Read();
+
+    // 4. End Cycle.
+    SCL_Low();
+    I2C_Delay();
+
+    return ack_received;
+}
+
+/**
+ * @brief  Receives 8 bits from the bus and sends an ACK or NACK.
+ * @details
+ * READ TIMING:
+ * 1. Previous SCL Falling Edge: Target asserts Data Bit.
+ * 2. Master Delay:              Wait for Target signal to stabilize.
+ * 3. Master SCL High:           Freeze data.
+ * 4. Master Sample:             Read SDA.
+ *
+ * @param  send_ack  true to send ACK (Request more data), false for NACK (End).
+ * @return The byte received from the Target.
+ */
+static uint8_t I2C_Receive(bool send_ack) {
+    uint8_t received_byte = 0;
+
+    // Ensure Master is not driving the bus (Input Mode)
+    SDA_High();
+
+    for (uint8_t i = 0; i < 8U; i++) {
+        // Wait for Target to setup data (triggered by previous SCL Low)
+        I2C_Delay();
+
+        // --- SAMPLE PHASE ---
+        SCL_High(); // Freeze data
+        I2C_Delay();
+
+        // Shift existing bits to make room for new LSB
+        received_byte = (uint8_t)(received_byte << 1U);
+
+        // Sample the line
+        if (SDA_Read())
+            received_byte = (uint8_t)(received_byte | 1U);
+
+        // --- END PHASE ---
+        // SCL Falling Edge triggers Target to assert next bit
+        SCL_Low();
+    }
+
+    // --- ACKNOWLEDGE PHASE ---
+    // Master drives SDA to answer the Target.
+    if (send_ack)
+        SDA_Low(); // ACK: "I received it, send next byte"
+    else
+        SDA_High(); // NACK: "I received it, stop sending"
+
+    I2C_Delay();
+    SCL_High(); // Pulse Clock
+    I2C_Delay();
+    SCL_Low();  // End Cycle
+    I2C_Delay();
+
+    // Always release SDA at the end of a byte read to return to Idle/Input
+    SDA_High();
+
+    return received_byte;
+}
+
+/**
+ * @brief  Generates the I2C START Condition and transmits the Address.
+ * @details
+ * PROTOCOL:
+ * 1. START: SDA transitions High->Low while SCL is High.
+ * 2. ADDRESS: 7-bit Dev Address + R/W Bit (0=Write, 1=Read).
+ *
+ * @param  dev_addr   7-bit I2C Address.
+ * @param  read_mode  true for READ operation, false for WRITE.
+ * @return true if Target ACKed the address, false if NACK.
+ */
+static bool I2C_Start(uint8_t dev_addr, bool read_mode) {
+    // Ensure bus is nominally Idle (High-Z) before generating Start
+    SDA_High();
+    I2C_Delay();
+    SCL_High();
+    I2C_Delay();
+
+    // --- GENERATE START ---
+    SDA_Low(); // SDA Falls (Start Condition)
+    I2C_Delay();
+
+    SCL_Low(); // SCL Falls (Bus Claimed)
+    I2C_Delay();
+
+    // Prepare Address Byte: (Addr << 1) | R/W bit
+    uint8_t packet = (uint8_t)(dev_addr << 1U);
+
+    if (read_mode)
+        packet = (uint8_t)(packet | 0x01U); // Set LSB to 1 (READ)
+    else
+        packet = (uint8_t)(packet & 0xFEU); // Clear LSB to 0 (WRITE)
+
+    // Transmit the address byte
+    return I2C_Transmit(packet);
+}
+
+/**
+ * @brief  Generates the I2C STOP Condition.
+ * @details
+ * PROTOCOL: SDA transitions Low->High while SCL is High.
+ * This signals the end of the transaction and releases the bus to IDLE.
+ */
+static void I2C_Stop(void) {
+    SDA_Low(); // Ensure SDA is Low first
+    I2C_Delay();
+
+    SCL_High(); // Clock goes High
+    I2C_Delay();
+
+    SDA_High(); // STOP: SDA Rises while SCL is High
+    I2C_Delay();
+}
+
+/* =========================================================================
+ *                     API FUNCTIONS
+ * ========================================================================= */
+
+/**
+ * @brief  Forces the bus into a known IDLE state.
+ * @details
+ * Used during initialization or error recovery.
+ * If a Target was interrupted mid-byte, it might be holding SDA Low.
+ * We toggle SCL 9 times to force the Target to shift out the remaining bits
+ * and see a NACK/STOP.
+ */
+void I2C_RecoverBus(void) {
+    // 1. Release lines to check state
+    SDA_High();
+    SCL_High();
+    I2C_Delay();
+
+    // 2. Check if SDA is stuck Low
+    if (SDA_Read() == false) {
+        // 3. Toggle SCL 9 times
+        for (uint8_t i = 0; i < 9U; i++) {
+            SCL_Low();
+            I2C_Delay();
+            SCL_High();
+            I2C_Delay();
+        }
+        // 4. Force Stop condition
+        I2C_Stop();
+    }
+}
+
+/**
+ * @brief  Initializes the I2C Bus.
+ * @details
+ * 1. Runs Bus Recovery to unstick any Targets.
+ * 2. Sets SDA/SCL to Input (High-Z).
+ * 3. Disables internal MCU pull-ups.
+ */
+void I2C_Init(void) {
+    I2C_RecoverBus();
+
+    // Set Idle State
+    SDA_High();
+    SCL_High();
+}
+
+/**
+ * @brief  Writes a buffer of data to a specific Target.
+ * @details
+ * Transaction: [START] [ADDR+W] [DATA 0] ... [DATA N] [STOP]
+ *
+ * @param  dev_addr  7-bit Target Address.
+ * @param  p_data    Pointer to source buffer.
+ * @param  length    Number of bytes to write.
+ * @return I2C_Status_t result (OK, NACK, NULL_PTR, INVALID_LEN).
+ */
+I2C_Status_t I2C_Transmit(uint8_t dev_addr, const uint8_t *p_data, uint8_t length) {
+    I2C_Status_t status = I2C_STATUS_OK;
+
+    // Rule 17.x: Parameter Checks
+    if (p_data == NULL)
+        return I2C_STATUS_NULL_PTR;
+    if (length == 0)
+        return I2C_STATUS_INVALID_LEN;
+
+    // 1. Start + Address
+    if (I2C_Start(dev_addr, false) == false) {
+        I2C_Stop();
+        return I2C_STATUS_NACK;
+    }
+
+    // 2. Data Payload
+    for (uint8_t i = 0; i < length; i++) {
+        if (I2C_Transmit(p_data[i]) == false) {
+            status = I2C_STATUS_NACK;
+            break; // Stop transmitting on error
+        }
+    }
+
+    // 3. Stop
+    I2C_Stop();
+
+    return status;
+}
+
+/**
+ * @brief  Reads data from a Target Register.
+ * @details
+ * Transaction: [START] [ADDR+W] [REG_ADDR] [RESTART] [ADDR+R] [DATA...] [STOP]
+ * Note: Uses Repeated Start (RESTART) to change direction without losing bus control.
+ *
+ * @param  dev_addr  7-bit Target Address.
+ * @param  reg_addr  Register address to read from.
+ * @param  p_data    Pointer to destination buffer.
+ * @param  length    Number of bytes to read.
+ * @return I2C_Status_t result.
+ */
+I2C_Status_t I2C_Read(uint8_t dev_addr, uint8_t reg_addr, uint8_t *p_data, uint8_t length) {
+    I2C_Status_t status = I2C_STATUS_OK;
+
+    if (p_data == NULL)
+        return I2C_STATUS_NULL_PTR;
+    if (length == 0)
+        return I2C_STATUS_INVALID_LEN;
+
+    // 1. Write Phase: Set Register Pointer
+    if (I2C_Start(dev_addr, false) == false) {
+        I2C_Stop();
+        return I2C_STATUS_NACK;
+    }
+
+    // Transmit Register Address
+    if (I2C_Transmit(reg_addr) == false) {
+        I2C_Stop();
+        return I2C_STATUS_NACK;
+    }
+
+    // 2. Read Phase: Restart (Start without previous Stop)
+    // We send START again to switch to Read Mode
+    if (I2C_Start(dev_addr, true) == false) {
+        I2C_Stop();
+        return I2C_STATUS_NACK;
+    }
+
+    // Receive Payload
+    for (uint8_t i = 0; i < length; i++) {
+        // Send ACK for all bytes except the last one.
+        // The last byte gets a NACK to signal "End of Read".
+        bool send_ack = (i < (length - 1U));
+
+        p_data[i] = I2C_Receive(send_ack);
+    }
+
+    // 3. Stop
+    I2C_Stop();
+
+    return status;
+}
+
+/**
+ * @brief  Writes a buffer of data to a specific Target.
+ * @details
+ * Transaction: [START] [ADDR+W] [DATA 0] ... [DATA N] [STOP]
+ *
+ * @param  dev_addr  7-bit Target Address.
+ * @param  p_data    Pointer to source buffer.
+ * @param  length    Number of bytes to write.
+ * @return I2C_Status_t result (OK, NACK, NULL_PTR, INVALID_LEN).
+ */
+I2C_Status_t I2C_Write(uint8_t dev_addr, const uint8_t *p_data, uint8_t length)
+{
+    I2C_Status_t status = I2C_STATUS_OK;
+
+    // Rule 17.x: Parameter Checks
+    if (p_data == NULL)
+        return I2C_STATUS_NULL_PTR;
+    if (length == 0)
+        return I2C_STATUS_INVALID_LEN;
+
+    // 1. Start + Address
+    // 'false' indicates Write Mode (R/W bit = 0)
+    if (I2C_Start(dev_addr, false) == false) {
+        I2C_Stop();
+        return I2C_STATUS_NACK;
+    }
+
+    // 2. Data Payload
+    for (uint8_t i = 0; i < length; i++) {
+        if (I2C_Transmit(p_data[i]) == false) {
+            status = I2C_STATUS_NACK;
+            break; // Stop transmitting immediately on error
+        }
+    }
+
+    // 3. Stop
+    // Always generate STOP to release the bus, even if NACK occurred.
+    I2C_Stop();
+
+    return status;
+}
+
+/*
+ * =========================================================================================
+ * BATTERY MONITOR SUBSYSTEM (PORTABLE)
+ * =========================================================================================
+ *
+ * 1. THEORY OF OPERATION: THE "SECRET VOLTMETER"
+ * -----------------------------------------------------------------------------------------
+ * Standard ADC usage measures an Unknown Input against a Known Reference (VCC).
+ * Formula: ADC = (Input / VCC) * 1024
+ *
+ * Here, we flip the equation. We measure the "Internal 1.1V Bandgap Reference"
+ * using VCC as the "Reference".
+ * Formula: ADC = (1.1V / VCC) * 1024
+ *
+ * Solving for VCC:
+ * VCC = (1.1V * 1024) / ADC
+ *
+ * 2. HARDWARE DIFFERENCES
+ * -----------------------------------------------------------------------------------------
+ * While both chips use the same logic, the internal Multiplexer (MUX) addresses differ:
+ *
+ * ATtiny85:
+ * - Reference: VCC (REFS[2:0] = 000)
+ * - Input:     1.1V Bandgap (MUX[3:0] = 1100 / 0x0C)
+ *
+ * ATmega328P (Arduino Uno):
+ * - Reference: AVCC (REFS[1:0] = 01)
+ * - Input:     1.1V Bandgap (MUX[3:0] = 1110 / 0x0E)
+ *
+ * 3. CALIBRATION
+ * -----------------------------------------------------------------------------------------
+ * The Internal Bandgap is nominally 1.100V but has a factory tolerance of +/- 10%.
+ * It might be 1.05V or 1.18V.
+ *
+ * CALIBRATION CONSTANT = Bandgap_Voltage_mV * 1024
+ * Default: 1100 * 1024 = 1126400
+ *
+ * To Calibrate:
+ * 1. Measure actual VCC with a multimeter (e.g., 3050 mV).
+ * 2. Read the raw ADC value from this function (e.g., 375).
+ * 3. New Constant = 3050 * 375 = 1143750.
+ * =========================================================================================
+ */
+
+/* =========================================================================
+ *                        CONFIGURATION MACROS
+ * ========================================================================= */
+
+/*
+ * Factory default constant.
+ * Formula: 1100mV * 1024 ADC Steps = 1126400
+ * Tune this value if your voltage reading is consistently off.
+ */
+#define BATTERY_CALIB_CONST  1126400L
+
+/*
+ * MUX CONFIGURATION
+ * Selects VCC as Reference and 1.1V Bandgap as Input.
+ */
+#if defined(__AVR_ATtiny85__)
+    /*
+     * ATtiny85:
+     * REFS[2:0] = 000 (VCC used as Ref, disconnect PB0)
+     * MUX[3:0]  = 1100 (Measure Vbg)
+     * Register ADMUX: [0 0 0 0] [1 1 0 0] -> 0x0C
+     */
+    #define ADC_MUX_SETTING  0x0C
+#else
+    /*
+     * ATmega328P (Arduino Uno):
+     * REFS[1:0] = 01 (AVCC with external cap at AREF)
+     * MUX[3:0]  = 1110 (Measure Vbg)
+     * Register ADMUX: [0 1 0 0] [1 1 1 0] -> 0x4E
+     */
+    #define ADC_MUX_SETTING  0x4E
+#endif
+
+/* =========================================================================
+ *                           PUBLIC API
+ * ========================================================================= */
+
+/**
+ * @brief  Measures the Power Supply Voltage (VCC).
+ * @return uint16_t Voltage in millivolts (e.g., 3005 = 3.005V).
+ */
+uint16_t Battery_GetVoltage(void) {
+    uint16_t adc_val;
+    uint32_t vcc_calc;
+
+    /* 1. Save previous ADMUX state?
+     * In this bare-metal project, we assume we own the ADC.
+     * If mixing with other ADC libs, save SREG/ADMUX here.
+     */
+
+    /* 2. Configure Multiplexer */
+    ADMUX = (uint8_t) ADC_MUX_SETTING;
+
+    /* 3. Enable ADC + Set Prescaler
+     * ADEN = 1 (Enable)
+     * ADPS = 110 (Prescaler 64).
+     * 8MHz / 64 = 125kHz ADC Clock (Ideal range is 50-200kHz).
+     */
+    ADCSRA = (uint8_t)((1U << ADEN) | (1U << ADPS2) | (1U << ADPS1));
+
+    /* 4. Stabilization Delay
+     * The Bandgap reference takes a noticeable time to charge the
+     * internal sample capacitor and stabilize (~2ms - 10ms).
+     */
+    _delay_ms(2);
+
+    /* 5. Dummy Conversion (Warm-up)
+     * The first reading after changing the Reference is often garbage.
+     * We perform one conversion and discard it.
+     */
+    ADCSRA |= (uint8_t)(1U << ADSC);     /* Start Conversion */
+    while ((ADCSRA & (1U << ADSC)) != 0U) {
+        /* Wait for bit to clear */
+    }
+
+    /* 6. Real Measurement */
+    ADCSRA |= (uint8_t)(1U << ADSC);     /* Start Conversion */
+    while ((ADCSRA & (1U << ADSC)) != 0U) {
+        /* Wait for bit to clear */
+    }
+
+    /* 7. Read ADC Result
+     * Order matters: Read Low byte, then High byte (Compiler handles this).
+     */
+    adc_val = ADC;
+
+    /* 8. Disable ADC
+     * Crucial for Coin Cell life. The ADC consumes ~200uA if left enabled.
+     */
+    ADCSRA &= (uint8_t) ~(1U << ADEN);
+
+    /* 9. Calculate VCC
+     * Avoid divide-by-zero if something catastrophic happened.
+     */
+    if (adc_val == 0U)
+        return 0U;
+
+    /* Math: CONST / ADC = VCC_mV */
+    vcc_calc = (uint32_t) BATTERY_CALIB_CONST / adc_val;
+
+    return (uint16_t) vcc_calc;
+}
+
+/**
+ * @brief  Calculates battery health percentage for CR2032.
+ * @note   Based on discharge curve under load (OLED on).
+ *
+ * @param  mv Voltage in millivolts.
+ * @return uint8_t Percentage (0-100).
+ */
+uint8_t Battery_GetPercentage(uint16_t mv) {
+    /* CR2032 Curve (Approximate linear region under load)
+     * > 3.00V : 100% (Fresh)
+     * < 2.40V : 0%   (Dead/Brownout risk)
+     */
+    if (mv >= 3000U) {
+        return 100U;
+    }
+    if (mv <= 2400U) {
+        return 0U;
+    }
+
+    /* Map Range: 2400..3000 (span 600) -> 0..100
+     * Formula: (Voltage - Min) / 6
+     */
+    return (uint8_t)((mv - 2400U) / 6U);
+}
+
+/*
+ * =========================================================================================
+ * SSD1306 OLED SUBSYSTEM (128x64 I2C)
+ * =========================================================================================
+ *
+ * 1. HARDWARE OVERVIEW
+ * -----------------------------------------------------------------------------------------
+ * - Controller: SSD1306 (Solomon Systech)
+ * - Resolution: 128 columns x 64 rows.
+ * - Interface:  I2C (Address 0x3C).
+ *
+ * 2. MEMORY LAYOUT (PAGE ADDRESSING MODE)
+ * -----------------------------------------------------------------------------------------
+ * The GDDRAM (Graphic Display Data RAM) is organized into 8 PAGES (Page 0 to Page 7).
+ * - Each Page represents 8 horizontal pixel rows.
+ * - Each Byte written to the display represents a vertical column of 8 pixels.
+ * - LSB (Bit 0) is the Top pixel; MSB (Bit 7) is the Bottom pixel of that page.
+ *
+ * Example: Writing 0x03 to Page 0, Column 0 lights up pixels (0,0) and (0,1).
+ *
+ * 3. OPTIMIZATION STRATEGY (STREAMING)
+ * -----------------------------------------------------------------------------------------
+ * The I2C overhead (Start/Address/Stop) is significant.
+ * - BAD:  Start -> Data(1 byte) -> Stop.
+ * - GOOD: Start -> Data(128 bytes) -> Stop.
+ *
+ * This driver groups writes into streams wherever possible (e.g., clearing the screen,
+ * drawing icons, printing strings) to maximize frame rate and minimize bus lockups.
+ *
+ * 4. MATH OPTIMIZATION (COMPASS ROTATION)
+ * -----------------------------------------------------------------------------------------
+ * The compass rotation uses Fixed Point Math (Q8.8 format) to avoid floating point libraries.
+ * - 256 represents 1.0.
+ * - This allows the ATtiny85 to perform rotation transforms using simple bit-shifts
+ *   and additions rather than expensive trigonometric calculations.
+ * =========================================================================================
+ */
+
+/* =========================================================================
+ *                        CONFIGURATION & CONSTANTS
+ * ========================================================================= */
+
+#define SSD1306_I2C_ADDR        0x3C
+#define SSD1306_WIDTH           128
+#define SSD1306_HEIGHT          64
+
+/* I2C Control Bytes */
+#define SSD1306_CTRL_CMD        0x00 // Co=0, D/C=0 (Command Stream)
+#define SSD1306_CTRL_DATA       0x40 // Co=0, D/C=1 (Data Stream)
+
+/* SSD1306 Command Set */
+typedef enum {
+    SSD1306_CMD_DISPLAY_OFF     = 0xAE,
+    SSD1306_CMD_DISPLAY_ON      = 0xAF,
+    SSD1306_CMD_SET_CONTRAST    = 0x81,
+    SSD1306_CMD_DISPLAY_ALL_ON  = 0xA5,
+    SSD1306_CMD_DISPLAY_NORMAL  = 0xA6,
+    SSD1306_CMD_DISPLAY_INVERSE = 0xA7,
+    SSD1306_CMD_MEM_MODE        = 0x20,
+    SSD1306_CMD_COL_LOW         = 0x00,
+    SSD1306_CMD_COL_HIGH        = 0x10,
+    SSD1306_CMD_PAGE_ADDR       = 0xB0,
+    SSD1306_CMD_SCAN_DIR_NORM   = 0xC0,
+    SSD1306_CMD_SCAN_DIR_REM    = 0xC8,
+    SSD1306_CMD_SEG_REMAP_NORM  = 0xA0,
+    SSD1306_CMD_SEG_REMAP_REM   = 0xA1,
+    SSD1306_CMD_SET_MUX_RATIO   = 0xA8,
+    SSD1306_CMD_SET_DISP_OFFSET = 0xD3,
+    SSD1306_CMD_SET_START_LINE  = 0x40,
+    SSD1306_CMD_CHARGE_PUMP     = 0x8D
+} ssd1306_cmd_t;
+
+/* =========================================================================
+ *                           ASSETS (FONTS & BITMAPS)
+ * ========================================================================= */
+
+/* Init Sequence (Command Stream) */
+static const uint8_t SSD1306_Init_Data[] PROGMEM = {
+    SSD1306_CMD_DISPLAY_OFF,
+    SSD1306_CMD_MEM_MODE, 0x02,       // Page Addressing
+    SSD1306_CMD_PAGE_ADDR,            // Start Page 0
+    SSD1306_CMD_SCAN_DIR_REM,         // Flip Y
+    SSD1306_CMD_COL_LOW,
+    SSD1306_CMD_COL_HIGH,
+    SSD1306_CMD_SET_START_LINE,
+    SSD1306_CMD_SET_CONTRAST, 0x7F,   // Medium Brightness
+    SSD1306_CMD_SEG_REMAP_REM,        // Flip X
+    SSD1306_CMD_DISPLAY_NORMAL,
+    SSD1306_CMD_SET_MUX_RATIO, 0x3F,  // 1/64 Duty
+    SSD1306_CMD_DISPLAY_ALL_ON - 1,   // Output follows RAM (0xA4)
+    SSD1306_CMD_SET_DISP_OFFSET, 0x00,
+    0xD5, 0xF0,                       // Osc Freq
+    0xD9, 0x22,                       // Pre-charge
+    0xDA, 0x12,                       // COM Hardware config
+    0xDB, 0x20,                       // VCOMH
+    SSD1306_CMD_CHARGE_PUMP, 0x14,    // Enable DC-DC
+    SSD1306_CMD_DISPLAY_ON
+};
+
+/* =========================================================================
+ *                           PRIVATE HELPERS
+ * ========================================================================= */
+
+/**
+ * @brief  Sends a single byte command to the OLED.
+ * @details Wraps I2C Start/Write/Stop.
+ * @param  c  Command byte.
+ */
+static void SSD1306_cmd(uint8_t cmd) {
+    uint8_t buffer[2];
+
+    buffer[0] = SSD1306_CTRL_CMD;
+    buffer[1] = cmd;
+    // Uses the I2C subsystem to safely handle Start/Stop/Ack
+    I2C_Write(SSD1306_I2C_ADDR, buffer, 2);
+}
+
+/**
+ * @brief  Initializes the SSD1306 OLED.
+ * @details Sends the initialization command sequence defined in INIT_SEQ.
+ */
+void SSD1306_Init(void) {
+    // Send init sequence byte-by-byte
+    // Optimization: Could stream this, but init is done once.
+    for (uint8_t i = 0; i < sizeof(SSD1306_Init_Data); i++)
+        SSD1306_cmd(pgm_read_byte(&SSD1306_Init_Data[i]));
+}
+
+/**
+ * @brief  Puts the OLED into deep sleep (< 10µA).
+ */
+void SSD1306_Sleep(void) {
+    SSD1306_cmd(SSD1306_CMD_DISPLAY_OFF);
+}
+
+/**
+ * @brief  Wakes the OLED from sleep (GDDRAM is retained!)
+ */
+void SSD1306_Wake(void) {
+    SSD1306_cmd(SSD1306_CMD_DISPLAY_ON); // Display ON
+}
+
+/**
+ * @brief  Sets the GDDRAM Page/Column pointer.
+ * @param  page  Page (0-7).
+ * @param  col   Column (0-127).
+ */
+void SSD1306_set_cursor(uint8_t page, uint8_t col) {
+    // Ensure bounds
+    if (page > 7) page = 7;
+    if (col > 127) col = 127;
+
+    uint8_t cmds[3];
+    cmds[0] = SSD1306_CMD_PAGE_ADDR | (page & 0x07);       // Set Page (0-7)
+    cmds[1] = SSD1306_CMD_COL_LOW | (col & 0x0F);          // Set Lower Column Start
+    cmds[2] = SSD1306_CMD_COL_HIGH | ((col >> 4) & 0x0F); // Set Higher Column Start
+
+    // We can't use I2C_WriteBuffer blindly for a pure command stream
+    // because I2C_WriteBuffer sends [00][CMD]...
+    // Here we send 3 separate commands.
+    SSD1306_cmd(cmds[0]);
+    SSD1306_cmd(cmds[1]);
+    SSD1306_cmd(cmds[2]);
+}
+
+/**
+ * @brief  Clears the entire display buffer.
+ * @details Writes 0x00 to all pages/columns.
+ */
+void SSD1306_Clear(void) {
+    for (uint8_t page = 0; page < 8; page++) {
+        SSD1306_set_cursor(page, 0);
+
+        // We need to write 128 bytes
+        I2C_Start(SSD1306_I2C_ADDR, false);
+        I2C_Transmit(SSD1306_CTRL_DATA); // Data Mode
+
+        for (uint8_t i = 0; i < 128; i++)
+            I2C_Transmit(0x00);
+
+        I2C_Stop();  // Send the packet to flush the buffer
+    }
+}
+
+/*
+ * =========================================================================================
+ * FIXED POINT TRIGONOMETRY SUBSYSTEM
+ * =========================================================================================
+ *
+ * THE PROBLEM:
+ * ------------
+ * The ATtiny85 (and Arduino Uno) has no FPU (Floating Point Unit).
+ * Calculating `sin(angle)` using standard `math.h` (`float` or `double`) triggers
+ * software emulation. This consumes ~2KB of Flash and takes thousands of cycles
+ * per calculation, causing the OLED display to lag visibly.
+ *
+ * THE SOLUTION: INTEGER LOOK-UP TABLE (LUT)
+ * -----------------------------------------
+ * We pre-calculate the Sine values for 0 to 90 degrees and store them in Flash (PROGMEM).
+ * We use the mathematical symmetry of the unit circle to derive 91-360 degrees.
+ *
+ * SCALING FACTOR (FIXED POINT):
+ * -----------------------------
+ * Instead of returning a float 0.0 to 1.0, we return an integer -127 to +127.
+ * - Value   0 represents 0.0
+ * - Value 127 represents 1.0
+ *
+ * To use the result in a calculation:
+ * Result = (Input * sinInt(angle)) / 127;
+ *
+ * Or, for faster bit-shifting (Power of 2):
+ * If we treat 127 as "almost 128", we can bit-shift >> 7.
+ * For the compass rotation, we scale this further to Q8.8 (256 base) via left-shifting.
+ * =========================================================================================
+ */
+
+/*
+ * Sine Look-Up Table (0 to 90 degrees).
+ * Range: 0 to 127.
+ *
+ * Why only 0-90?
+ * A sine wave is symmetrical.
+ * - Quadrant 1 (0-90):   Values increase 0 -> 1.
+ * - Quadrant 2 (91-180): Values decrease 1 -> 0 (Mirror of Q1).
+ * - Quadrant 3 (181-270): Values decrease 0 -> -1 (Negative Mirror of Q1).
+ * - Quadrant 4 (271-360): Values increase -1 -> 0 (Negative Mirror of Q1).
+ *
+ * Storing only 91 bytes saves 270 bytes of Flash memory.
+ */
+static const int8_t sin_LUT[] PROGMEM = {
+    0, 2, 4, 6, 8, 11, 13, 15, 17, 19, 22, 24, 26, 28, 31, 33, 35, 37, 39, 41,
+    43, 45, 47, 50, 52, 54, 55, 57, 59, 61, 63, 65, 67, 69, 71, 72, 74, 76, 78, 79,
+    81, 83, 85, 86, 88, 89, 91, 92, 94, 95, 97, 98, 99, 101, 102, 103, 105, 106, 107, 108,
+    110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 119, 120, 121, 122, 122, 123, 124, 124, 125, 125,
+    126, 126, 126, 127, 127, 127, 127, 127, 127, 127, 127
+};
+
+/**
+ * @brief  Calculates the Sine of an angle using Integer Math.
+ *
+ * @param  angle  Input angle in degrees.
+ *                Accepted Range: -32768 to +32767.
+ *                (Ideally 0-359 for speed).
+ *
+ * @return int8_t Scaled Sine value (-127 to +127).
+ */
+static int8_t sin_deg(int16_t angle) {
+    /*
+     * 1. INPUT NORMALIZATION
+     * ----------------------
+     * We need the angle to be in the range [0, 359].
+     *
+     * Optimization Note:
+     * On an 8-bit AVR, the modulo operator (%) involves a software division library
+     * which is slow (~100-200 cycles).
+     * Since compass headings usually change incrementally (e.g., 359 -> 360),
+     * a `while` loop subtract/add is significantly faster than division.
+     */
+    while (angle < 0)
+        angle += 360;
+    while (angle >= 360)
+        angle -= 360;
+
+    /*
+     * 2. QUADRANT MAPPING
+     * -------------------
+     * Map the 0-359 angle to the 0-90 lookup table index.
+     */
+
+    /* Quadrant 1: 0 to 90 degrees */
+    if (angle <= 90) {
+        /* Direct Lookup */
+        return (int8_t) pgm_read_byte(&sin_LUT[angle]);
+    }
+
+    /* Quadrant 2: 91 to 180 degrees */
+    if (angle <= 180) {
+        /* Mirror Horizontal: sin(170) == sin(10) */
+        return (int8_t) pgm_read_byte(&sin_LUT[180 - angle]);
+    }
+
+    /* Quadrant 3: 181 to 270 degrees */
+    if (angle <= 270) {
+        /* Mirror Vertical: sin(190) == -sin(10) */
+        /* Note: We read the positive value, then negate the result. */
+        return -(int8_t) pgm_read_byte(&sin_LUT[angle - 180]);
+    }
+
+    return -(int8_t) pgm_read_byte(&sin_LUT[360 - angle]);
+}
+
+/**
+ * @brief  Calculates the Cosine of an angle using Integer Math.
+ *
+ * @details
+ * Relies on the trigonometric identity: cos(x) = sin(x + 90).
+ * This allows us to reuse the exact same LUT and normalization logic
+ * without consuming extra Flash memory for a Cosine table.
+ *
+ * @param  angle  Input angle in degrees.
+ * @return int8_t Scaled Cosine value (-127 to +127).
+ */
+static int8_t cos_deg(int16_t angle) {
+    // cos(x) is just sin(x + 90)
+    return sin_deg(angle + 90);
+}
+
+/**
+ * @brief  Computes approximate angle in degrees (0-359).
+ *
+ * OPTIMIZATION STRATEGY:
+ * 1. SYMMETRY: We only calculate the angle for 0-45 degrees (Slope 0.0 to 1.0).
+ *              We map the other 7 octants using simple subtraction.
+ *
+ * 2. LINEAR APPROXIMATION:
+ *    Real formula: theta = atan(y/x)
+ *    Linear approx: theta ~= 45 * (y/x)
+ *    Error: Max ~4 degrees at 22.5 degrees. Acceptable for visual compass.
+ *
+ * 3. 16-BIT MATH:
+ *    To calculate (y * 45) / x without overflowing 16-bit integers (max 32767),
+ *    inputs are bit-shifted down until they fit. This avoids linking the heavy
+ *    32-bit division library.
+ *
+ * @param  y  Signed 16-bit Y component.
+ * @param  x  Signed 16-bit X component.
+ * @return uint16_t Angle in degrees.
+ */
+uint16_t atan2_deg(int16_t y, int16_t x) {
+    // 1. Handle special case (Origin)
+    if (x == 0 && y == 0) return 0;
+
+    // 2. Get Absolute Values
+    // Cast to unsigned to safely handle -32768
+    uint16_t ax = (x < 0) ? (uint16_t)(-x) : (uint16_t)x;
+    uint16_t ay = (y < 0) ? (uint16_t)(-y) : (uint16_t)y;
+
+    // 3. Determine Min/Max for the 0-45 degree ratio
+    uint16_t mn = (ax < ay) ? ax : ay;
+    uint16_t mx = (ax > ay) ? ax : ay;
+
+    // 4. Pre-scale to prevent overflow
+    // We need to calculate (mn * 45) / mx.
+    // (mn * 45) must fit in uint16_t (< 65535).
+    // Therefore, mn must be < 1456 (65535 / 45).
+    while (mx > 1400) {
+        mx >>= 1;
+        mn >>= 1;
+    }
+
+    // 5. Calculate Octant Angle (0-45 degrees)
+    // Formula: angle = slope * 45
+    // Note: If mx is 0 (should be impossible handled by step 1), result is 0.
+    uint16_t angle = (mn * 45) / mx;
+
+    // 6. Map Octant to Circle (0-360)
+    if (x >= 0) {
+        if (y >= 0) {
+            // Quadrant 1 (x+, y+)
+            if (ax >= ay) return angle;          // 0-45
+            else          return 90 - angle;     // 45-90
+        } else {
+            // Quadrant 4 (x+, y-)
+            if (ax >= ay) return 360 - angle;    // 315-360
+            else          return 270 + angle;    // 270-315
+        }
+    } else {
+        if (y >= 0) {
+            // Quadrant 2 (x-, y+)
+            if (ax >= ay) return 180 - angle;    // 135-180
+            else          return 90 + angle;     // 90-135
+        } else {
+            // Quadrant 3 (x-, y-)
+            if (ax >= ay) return 180 + angle;    // 180-225
+            else          return 270 - angle;    // 225-270
+        }
+    }
+}
+
+/* =========================================================================
+ *                    COMPASS Bitmaps
+ * ========================================================================= */
+
+enum { COMPASS_WIDTH = 32, COMPASS_HEIGHT = 32 };
+
+/**
+ * Compass Bezel Bitmap 32x32 - Transposed for SSD1306 Page Addressing
+ * 4 Pages (rows of 8px height), 32 Columns wide
+ */
+const uint8_t OLED_bezel_data[] PROGMEM = {
+    // Page 0 (rows 0–7)
+    0x00, 0x00, 0x80, 0x40,  0x20, 0x10, 0x08, 0x04,
+    0x04, 0x02, 0x02, 0x02,  0x01, 0x01, 0x01, 0x01,
+    0x01, 0x01, 0x01, 0x01,  0x02, 0x02, 0x02, 0x04,
+    0x04, 0x08, 0x10, 0x20,  0x40, 0x80, 0x00, 0x00,
+
+    // Page 1 (rows 8–15)
+    0xf0, 0x0e, 0x01, 0x00,  0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,  0x00, 0x01, 0x0e, 0xf0,
+
+    // Page 2 (rows 16–23)
+    0x0f, 0x70, 0x80, 0x00,  0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,  0x00, 0x80, 0x70, 0x0f,
+
+    // Page 3 (rows 24–31)
+    0x00, 0x00, 0x01, 0x02,  0x04, 0x08, 0x10, 0x20,
+    0x20, 0x40, 0x40, 0x40,  0x80, 0x80, 0x80, 0x80,
+    0x80, 0x80, 0x80, 0x80,  0x40, 0x40, 0x40, 0x20,
+    0x20, 0x10, 0x08, 0x04,  0x02, 0x01, 0x00, 0x00,
+};
+
+/**
+ * Compass Needle Bitmap 32x32 - Transposed for SSD1306 Page Addressing
+ * 4 Pages (rows of 8px height), 32 Columns wide
+ */
+const uint8_t OLED_needle_data[] PROGMEM = {
+    // Page 0 (rows 0–7)
+    0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,  0x00, 0xc0, 0xf0, 0xfc,
+    0xfc, 0xf0, 0xc0, 0x00,  0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
+
+    // Page 1 (rows 8–15)
+    0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
+    0x00, 0xc0, 0xf0, 0xfc,  0xff, 0xff, 0x7f, 0xff,
+    0xff, 0x7f, 0xff, 0xff,  0xfc, 0xf0, 0xc0, 0x00,
+    0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
+
+    // Page 2 (rows 16–23)
+    0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
+    0x03, 0x07, 0x03, 0x01,  0x00, 0x00, 0x00, 0xff,
+    0xff, 0x00, 0x00, 0x00,  0x01, 0x03, 0x07, 0x03,
+    0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
+
+    // Page 3 (rows 24–31)
+    0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x3f,
+    0x3f, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,  0x00, 0x00, 0x00, 0x00,
+};
+
+/**
+ * @brief  Draws a rotated 32x32 compass needle using Inverse Texture Mapping.
+ *
+ * ================================================================================================
+ * 1. ALGORITHM: INVERSE TEXTURE MAPPING
+ * ================================================================================================
+ * To rotate a bitmap, we do NOT iterate through the Source pixels and move them to the Destination.
+ * Doing so results in "holes" (artifacts) because integer coordinates rarely map perfectly after rotation.
+ *
+ * Instead, we perform the INVERSE:
+ * 1. We iterate through every pixel $(x,y)$ of the DESTINATION buffer (the screen).
+ * 2. We mathematically project that point backwards onto the SOURCE bitmap $(u,v)$.
+ * 3. If the projected $(u,v)$ lands on a lit pixel in the source, we light the pixel at $(x,y)$.
+ *
+ * ================================================================================================
+ * 2. MATHEMATICS: AFFINE TRANSFORMATION MATRIX
+ * ================================================================================================
+ * The mapping from Destination $(x,y)$ to Source $(u,v)$ rotated by angle $\theta$ is:
+ *
+ *     u = center_u + (x - center_x) * cos(θ) - (y - center_y) * sin(θ)
+ *     v = center_v + (x - center_x) * sin(θ) + (y - center_y) * cos(θ)
+ *
+ * ================================================================================================
+ * 3. OPTIMIZATION: Q8.8 FIXED POINT MATH
+ * ================================================================================================
+ * The ATtiny85 has no FPU (Floating Point Unit). Calculating sines and cosines (0.0 to 1.0)
+ * is too slow. We use "Q8.8 Fixed Point" integer math:
+ * - 1.0 is represented as 256 (1 << 8).
+ * - 0.5 is represented as 128.
+ * - Coordinates store the integer part in the upper byte, fractional part in the lower byte.
+ * - To get the integer pixel coordinate: `(value >> 8)`.
+ *
+ * ================================================================================================
+ * 4. THE GRADIENTS (dUdX, dUdY, dVdX, dVdY)
+ * ================================================================================================
+ * Matrix multiplication requires 4 multiplications per pixel. This is too slow for the inner loop.
+ * We use "Incremental Calculation" (similar to Bresenham's Line Algorithm).
+ *
+ * We pre-calculate how much $u$ and $v$ change when we move exactly 1 pixel on the screen.
+ * Since we step through the screen linearly (Column by Column, Row by Row), we just ADD these values.
+ *
+ *   dUdX = cos(θ) * 256   -->  How much 'u' changes when Screen X increases by 1.
+ *   dUdY = sin(θ) * 256   -->  How much 'v' changes when Screen X increases by 1.
+ *   dVdX = -sin(θ) * 256  -->  How much 'u' changes when Screen Y increases by 1.
+ *   dVdY = cos(θ) * 256   -->  How much 'v' changes when Screen Y increases by 1.
+ *
+ *   Inner Loop Logic:
+ *   u_next = u_current + dUdX;
+ *   v_next = v_current + dUdY;
+ *
+ * @param  page0  page for top-left corner compas (0-7)
+ * @param  col0  column for top-left corner compas (0-1287)
+ * @param  angle  Rotation angle in degrees (0-360).
+ */
+void OLED_draw_compass(uint8_t page0, uint8_t col0, int16_t angle) {
+
+    // --- 2. TRIGONOMETRY (Q8.8 Base) ---
+    // Fetch Sine/Cosine (Result -127 to +127)
+    const int8_t isin = sin_deg(angle);
+    const int8_t icos = cos_deg(angle);
+
+	// sinInt returns +/- 127. Shift << 1 makes it +/- 254 (approx 256 or 1.0).
+
+    // --- 3. GRADIENTS (Delta accumulators) ---
+    int16_t dUdX = icos << 1;    // Change in U per X step
+    int16_t dVdX = isin << 1;    // Change in V per X step
+    int16_t dUdY = (-isin) << 1; // Change in U per Y step
+    int16_t dVdY = icos << 1;    // Change in V per Y step
+
+    // --- 4. CALCULATE ORIGIN (Screen 0,0 maps to Source U,V) ---
+    // Formula: Center_Original - Center_Rotated
+    // Expanded: CX - (CX*cos - CY*sin), CY - (CX*sin + CY*cos)
+    // We keep these in Q8.8 format (<< 8).
+
+    // non-optimised
+    // int32_t start_u = (CX * 256) - (CX * icos * 2 - CY * isin * 2);
+    // int32_t start_v = (CY * 256) - (CX * isin * 2 + CY * icos * 2);
+
+    // optimised
+    int16_t start_u = (COMPASS_WIDTH << 7) - (COMPASS_WIDTH * icos - COMPASS_HEIGHT * isin);
+    int16_t start_v = (COMPASS_HEIGHT << 7) - (COMPASS_WIDTH * isin + COMPASS_HEIGHT * icos);
+
+    // --- 5. RENDER LOOP ---
+    // Buffer: 1 Control Byte + 32 Data Bytes
+    uint8_t i2c_buf[1 + COMPASS_WIDTH];
+    i2c_buf[0] = SSD1306_CTRL_DATA;
+
+    // Iterate 4 Pages (Vertical strips of 8 pixels)
+    for (uint8_t page = 0; page < 4; page++) {
+
+        // PRE-LOAD BACKGROUND (Optimization: Clears buffer + Draws Ring)
+        const uint8_t *ring_ptr = &OLED_bezel_data[page * COMPASS_WIDTH];
+        for (uint8_t col = 0; col < COMPASS_WIDTH; col++)
+            i2c_buf[1 + col] = pgm_read_byte(ring_ptr++);
+
+        // Initialize Row Accumulators for this Page
+        int32_t row_u = start_u;
+        int32_t row_v = start_v;
+
+        // Iterate 8 Rows inside the Page
+        for (uint8_t row = 0; row < 8; row++) {
+
+            // Initialize Column Accumulators from Row Start
+            int32_t u = row_u;
+            int32_t v = row_v;
+
+            // Tight Inner Loop: Iterate Columns 0..31
+            for (uint8_t col = 0; col < COMPASS_WIDTH; col++) {
+
+                // Downsample Fixed Point -> Integer (Fast Bounds Check)
+                // Casting to uint16_t handles negative numbers by wrapping them to > 32
+                uint16_t sx = (uint16_t)(u >> 8);
+                uint16_t sy = (uint16_t)(v >> 8);
+
+                // Check Bounds
+                if (sx < COMPASS_WIDTH && sy < COMPASS_HEIGHT) {
+                    // Fetch Pixel (Bitmap is Page-Major: 8 rows per byte)
+                    // Index = (Row_Block * Width) + Col
+                    uint16_t idx  = ((sy >> 3) * COMPASS_WIDTH) + sx;
+                    uint8_t  bits = pgm_read_byte(&OLED_needle_data[idx]);
+
+                    // Check specific bit in the byte (y % 8)
+                    if (bits & (1 << (sy & 7))) {
+                        i2c_buf[1 + col] |= (1 << row);
+                    }
+                }
+
+                // X-STEP: Add Horizontal Gradients
+                u += dUdX;
+                v += dVdX;
+            }
+
+            // Y-STEP: Add Vertical Gradients (Move down 1 pixel)
+            row_u += dUdY;
+            row_v += dVdY;
+        }
+
+        // Advance the "Global Start" for the next Page (8 pixels down)
+        // We multiply gradient by 8 (shift << 3)
+        start_u += (dUdY << 3);
+        start_v += (dVdY << 3);
+
+        // Flush Page to I2C
+        SSD1306_set_cursor(page0 + page, col0);
+        I2C_Write(SSD1306_I2C_ADDR, i2c_buf, COMPASS_WIDTH + 1);
+    }
+}
+
+/* =========================================================================
+ *                   TEXT RENDERING SUBSYSTEM
+ * =========================================================================
+ *
+ * OVERVIEW:
+ * ---------
+ * This subsystem handles converting primitive data types (char, int, uint)
+ * into visual pixels on the OLED.
+ *
+ * MEMORY OPTIMIZATION:
+ * --------------------
+ * - No Framebuffer: We write directly to the display hardware (GDDRAM).
+ * - No Floating Point: Integer math only for digit extraction.
+ * - Flash Storage: Fonts and Look-Up Tables (LUT) are stored in PROGMEM.
+ *
+ * I2C PERFORMANCE STRATEGY (STREAMING):
+ * -------------------------------------
+ * To prevent I2C Bus Thrashing (which can lock up sensors on the same bus),
+ * we avoid "Stop/Start" sequences between every character.
+ *
+ * - Bad:  [Start '1' Stop] [Start '2' Stop] [Start '3' Stop]
+ * - Good: [Start '1' '2' '3' Stop]
+ *
+ * The print functions perform a single I2C Transaction for the entire string.
+ * =========================================================================
+ */
+
+/*
+ * Powers of 10 Lookup Table.
+ * Used for digit extraction by repeated subtraction.
+ * Stored in Flash to save RAM.
+ */
+static const uint16_t pow10_LUT[] PROGMEM = {
+    1, 10, 100, 1000, 10000
+};
+
+/*
+ * 5x7 ASCII Font Table (0x20 Space to 0x7F Degree).
+ * Stored in Flash (PROGMEM) to save RAM.
+ */
+const uint8_t font5x7_LUT[] PROGMEM = {
+    0x00, 0x00, 0x00, 0x00, 0x00,  // 0x20 Space
+    0x00, 0x00, 0x5F, 0x00, 0x00,  // 0x21 !
+    0x00, 0x07, 0x00, 0x07, 0x00,  // 0x22 "
+    0x14, 0x7F, 0x14, 0x7F, 0x14,  // 0x23 #
+    0x24, 0x2A, 0x7F, 0x2A, 0x12,  // 0x24 $
+    0x23, 0x13, 0x08, 0x64, 0x62,  // 0x25 %
+    0x36, 0x49, 0x55, 0x22, 0x50,  // 0x26 &
+    0x00, 0x05, 0x03, 0x00, 0x00,  // 0x27 '
+    0x00, 0x1C, 0x22, 0x41, 0x00,  // 0x28 (
+    0x00, 0x41, 0x22, 0x1C, 0x00,  // 0x29 )
+    0x14, 0x08, 0x3E, 0x08, 0x14,  // 0x2A *
+    0x08, 0x08, 0x3E, 0x08, 0x08,  // 0x2B +
+    0x00, 0x50, 0x30, 0x00, 0x00,  // 0x2C ,
+    0x08, 0x08, 0x08, 0x08, 0x08,  // 0x2D -
+    0x00, 0x60, 0x60, 0x00, 0x00,  // 0x2E .
+    0x20, 0x10, 0x08, 0x04, 0x02,  // 0x2F /
+    0x3E, 0x51, 0x49, 0x45, 0x3E,  // 0x30 0
+    0x00, 0x42, 0x7F, 0x40, 0x00,  // 0x31 1
+    0x42, 0x61, 0x51, 0x49, 0x46,  // 0x32 2
+    0x21, 0x41, 0x45, 0x4B, 0x31,  // 0x33 3
+    0x18, 0x14, 0x12, 0x7F, 0x10,  // 0x34 4
+    0x27, 0x45, 0x45, 0x45, 0x39,  // 0x35 5
+    0x3C, 0x4A, 0x49, 0x49, 0x30,  // 0x36 6
+    0x01, 0x71, 0x09, 0x05, 0x03,  // 0x37 7
+    0x36, 0x49, 0x49, 0x49, 0x36,  // 0x38 8
+    0x06, 0x49, 0x49, 0x29, 0x1E,  // 0x39 9
+    0x00, 0x36, 0x36, 0x00, 0x00,  // 0x3A :
+    0x00, 0x56, 0x36, 0x00, 0x00,  // 0x3B ;
+    0x08, 0x14, 0x22, 0x41, 0x00,  // 0x3C <
+    0x14, 0x14, 0x14, 0x14, 0x14,  // 0x3D =
+    0x00, 0x41, 0x22, 0x14, 0x08,  // 0x3E >
+    0x02, 0x01, 0x51, 0x09, 0x06,  // 0x3F ?
+    0x32, 0x49, 0x79, 0x41, 0x3E,  // 0x40 @
+    0x7E, 0x11, 0x11, 0x11, 0x7E,  // 0x41 A
+    0x7F, 0x49, 0x49, 0x49, 0x36,  // 0x42 B
+    0x3E, 0x41, 0x41, 0x41, 0x22,  // 0x43 C
+    0x7F, 0x41, 0x41, 0x22, 0x1C,  // 0x44 D
+    0x7F, 0x49, 0x49, 0x49, 0x41,  // 0x45 E
+    0x7F, 0x09, 0x09, 0x09, 0x01,  // 0x46 F
+    0x3E, 0x41, 0x49, 0x49, 0x7A,  // 0x47 G
+    0x7F, 0x08, 0x08, 0x08, 0x7F,  // 0x48 H
+    0x00, 0x41, 0x7F, 0x41, 0x00,  // 0x49 I
+    0x20, 0x40, 0x41, 0x3F, 0x01,  // 0x4A J
+    0x7F, 0x08, 0x14, 0x22, 0x41,  // 0x4B K
+    0x7F, 0x40, 0x40, 0x40, 0x40,  // 0x4C L
+    0x7F, 0x02, 0x0C, 0x02, 0x7F,  // 0x4D M
+    0x7F, 0x04, 0x08, 0x10, 0x7F,  // 0x4E N
+    0x3E, 0x41, 0x41, 0x41, 0x3E,  // 0x4F O
+    0x7F, 0x09, 0x09, 0x09, 0x06,  // 0x50 P
+    0x3E, 0x41, 0x51, 0x21, 0x5E,  // 0x51 Q
+    0x7F, 0x09, 0x19, 0x29, 0x46,  // 0x52 R
+    0x46, 0x49, 0x49, 0x49, 0x31,  // 0x53 S
+    0x01, 0x01, 0x7F, 0x01, 0x01,  // 0x54 T
+    0x3F, 0x40, 0x40, 0x40, 0x3F,  // 0x55 U
+    0x1F, 0x20, 0x40, 0x20, 0x1F,  // 0x56 V
+    0x3F, 0x40, 0x38, 0x40, 0x3F,  // 0x57 W
+    0x63, 0x14, 0x08, 0x14, 0x63,  // 0x58 X
+    0x07, 0x08, 0x70, 0x08, 0x07,  // 0x59 Y
+    0x61, 0x51, 0x49, 0x45, 0x43,  // 0x5A Z
+    0x00, 0x7F, 0x41, 0x41, 0x00,  // 0x5B [
+    0x02, 0x04, 0x08, 0x10, 0x20,  // 0x5C \ (Backslash)
+    0x00, 0x41, 0x41, 0x7F, 0x00,  // 0x5D ]
+    0x04, 0x02, 0x01, 0x02, 0x04,  // 0x5E ^
+    0x80, 0x80, 0x80, 0x80, 0x80,  // 0x5F
+    0x02, 0x01, 0x00, 0x00, 0x00,  // 0x60 ` (Backtick / Grave)
+    0x20, 0x54, 0x54, 0x54, 0x78,  // 0x61 a
+    0x7F, 0x48, 0x44, 0x44, 0x38,  // 0x62 b
+    0x38, 0x44, 0x44, 0x44, 0x20,  // 0x63 c
+    0x38, 0x44, 0x44, 0x48, 0x7F,  // 0x64 d
+    0x38, 0x54, 0x54, 0x54, 0x18,  // 0x65 e
+    0x08, 0x7E, 0x09, 0x01, 0x02,  // 0x66 f
+    0x0C, 0x52, 0x52, 0x52, 0x3E,  // 0x67 g
+    0x7F, 0x08, 0x04, 0x04, 0x78,  // 0x68 h
+    0x00, 0x44, 0x7D, 0x40, 0x00,  // 0x69 i
+    0x20, 0x40, 0x44, 0x3D, 0x00,  // 0x6A j
+    0x7F, 0x10, 0x28, 0x44, 0x00,  // 0x6B k
+    0x00, 0x41, 0x7F, 0x40, 0x00,  // 0x6C l
+    0x7C, 0x04, 0x18, 0x04, 0x78,  // 0x6D m
+    0x7C, 0x08, 0x04, 0x04, 0x78,  // 0x6E n
+    0x38, 0x44, 0x44, 0x44, 0x38,  // 0x6F o
+    0x7C, 0x14, 0x14, 0x14, 0x08,  // 0x70 p
+    0x08, 0x14, 0x14, 0x18, 0x7C,  // 0x71 q
+    0x7C, 0x08, 0x04, 0x04, 0x08,  // 0x72 r
+    0x48, 0x54, 0x54, 0x54, 0x20,  // 0x73 s
+    0x04, 0x3F, 0x44, 0x40, 0x20,  // 0x74 t
+    0x3C, 0x40, 0x40, 0x20, 0x7C,  // 0x75 u
+    0x1C, 0x20, 0x40, 0x20, 0x1C,  // 0x76 v
+    0x3C, 0x40, 0x30, 0x40, 0x3C,  // 0x77 w
+    0x44, 0x28, 0x10, 0x28, 0x44,  // 0x78 x
+    0x0C, 0x50, 0x50, 0x50, 0x3C,  // 0x79 y
+    0x44, 0x64, 0x54, 0x4C, 0x44,  // 0x7A z
+    0x00, 0x08, 0x36, 0x41, 0x00,  // 0x7B {
+    0x00, 0x00, 0x7F, 0x00, 0x00,  // 0x7C |
+    0x00, 0x41, 0x36, 0x08, 0x00,  // 0x7D }
+    0x10, 0x08, 0x08, 0x10, 0x08,  // 0x7E ~
+    0x06, 0x09, 0x09, 0x06, 0x00,  // 0x7F ° (DEGREE SYMBOL)
+};
+
+
+/**
+ * @brief  Sets cursor position in character size units
+ * @param  page  Page (0-7).
+ * @param  col   Column (0-21).
+ */
+void OLED_set_cursor(uint8_t page, uint8_t col) {
+    // Ensure bounds
+    if (page > 7) page = 7;
+    if (col > 21) col = 21;
+
+    // character glyph size is (5+1)*(7+1)
+    SSD1306_set_cursor(page, col * 6);
+}
+
+/**
+ * @brief  Streams pixel data for a character to the I2C Bus.
+ * @note   ASSUMES I2C BUS IS ALREADY ACTIVE (Start Condition sent).
+ *         Does NOT generate Start or Stop conditions.
+ *
+ * @param  c  ASCII character to draw.
+ */
+static void OLED_stream_char(char c) {
+    const uint8_t *p;
+    uint8_t       i;
+
+    // Bounds check: Map unknown chars to '?'
+    if (c < 0x20 || c > 0x7F) {
+        c = '?';
+    }
+
+    // Convert ASCII to Font Table Index (Offset 0x20)
+    c -= 0x20;
+
+    // Calculate pointer to font data in Flash
+    // Math: Base Address + (Index * 5 bytes/char)
+    p = font5x7_LUT + ((uint16_t) c * 5);
+
+    // Stream 5 columns of pixel data
+    for (i = 0U; i < 5U; i++) {
+        I2C_Transmit(pgm_read_byte(p));
+        p++;
+    }
+
+    // Stream 1 column of spacing (Kerning)
+    I2C_Transmit(0x00);
+}
+
+/**
+ * @brief  Prints a single character to the OLED.
+ * @details Performs a standalone I2C transaction.
+ *
+ * @param  c  Character to print.
+ */
+void OLED_char(char c) {
+    // 1. Start Transaction
+    I2C_Start(SSD1306_I2C_ADDR, false);
+
+    // 2. Control Byte: Data Stream (0x40)
+    I2C_Transmit(SSD1306_CTRL_DATA);
+
+    // 3. Stream Data
+    OLED_stream_char(c);
+
+    // 4. Stop Transaction
+    I2C_Stop();
+}
+
+/**
+ * @brief  Prints a string to the OLED.
+ * @details Performs a standalone I2C transaction.
+ *
+ * @param  str  Pointer to the null-terminated string in RAM.
+ */
+void OLED_string(const char *str) {
+    // 1. Start Transaction
+    I2C_Start(SSD1306_I2C_ADDR, false);
+
+    // 2. Control Byte: Data Stream (0x40)
+    I2C_Transmit(SSD1306_CTRL_DATA);
+
+    // 3. Stream Data
+    while (*str)
+        OLED_stream_char(*str++);
+
+    // 4. Stop Transaction
+    I2C_Stop();
+}
+
+/**
+ * @brief  Prints an unsigned 16-bit integer (0..65535).
+ * @details Optimized to use a single I2C transaction for the whole number.
+ *
+ * @param  num    Number to print.
+ * @param  width  Minimum width (0 = auto). Pads with leading spaces.
+ */
+void OLED_print_uint(uint16_t num, int8_t width = 0) {
+    // 1. Start Transaction
+    I2C_Start(SSD1306_I2C_ADDR, false);
+    I2C_Transmit(SSD1306_CTRL_DATA); // Data Mode
+
+    // 2. Digit Extraction Loop (10000 down to 10)
+    for (int8_t round = 4; round > 0; --round) {
+        char     ch  = '0';
+        uint16_t pow = pgm_read_word(&pow10_LUT[round]);
+
+        // Subtractive Division (Faster than hardware DIV on ATtiny)
+        while (num >= pow) {
+            num -= pow;
+            ch++;
+        }
+
+        // Rendering Logic
+        if (ch != '0' || width == 0) {
+            // Significant digit found, or we are in "print all" mode
+            OLED_stream_char(ch);
+            width = 0; // Disable padding once we print a digit
+        } else if (round < width) {
+            // We are within the fixed width, but digit is 0
+            // Print leading space for alignment
+            OLED_stream_char(' ');
+        }
+    }
+
+    // 3. Final Digit (Ones place)
+    // Always printed, even if 0
+    OLED_stream_char('0' + (uint8_t) num);
+
+    // 4. Stop Transaction //
+    I2C_Stop();
+}
+
+/**
+ * @brief  Prints an unsigned 16-bit integer (0..65535).
+ * @details Optimized to use a single I2C transaction for the whole number.
+ *
+ * @param  num    Number to print.
+ * @param  width  Minimum width (0 = auto). Pads with leading spaces.
+ */
+void OLED_sprint_uint(char *str, uint16_t num, int8_t width = 0) {
+    // 2. Digit Extraction Loop (10000 down to 10)
+    for (int8_t round = 4; round > 0; --round) {
+        char     ch  = '0';
+        uint16_t pow = pgm_read_word(&pow10_LUT[round]);
+
+        // Subtractive Division (Faster than hardware DIV on ATtiny)
+        while (num >= pow) {
+            num -= pow;
+            ch++;
+        }
+
+        // Rendering Logic
+        if (ch != '0' || width == 0) {
+            // Significant digit found, or we are in "print all" mode
+            *str++ = ch;
+            width = 0; // Disable padding once we print a digit
+        } else if (round < width) {
+            // We are within the fixed width, but digit is 0
+            // Print leading space for alignment
+            *str++ = ' ';
+        }
+    }
+
+    // 3. Final Digit (Ones place)
+    // Always printed, even if 0
+    *str++ = '0' + (uint8_t) num;
+
+    // 4. Terminate string
+    *str++ = 0;
+}
+
+/**
+ * @brief  Prints a signed 16-bit integer (-32768..32767).
+ * @details Handles negative signs and padding correctly within the stream.
+ *
+ * @param  num0   Signed number to print.
+ * @param  width  Minimum width. Minus sign consumes 1 character width.
+ */
+void OLED_print_int(int16_t num0, int8_t width = 0) {
+    uint16_t num;
+    char     minus = 0;
+
+    // 1. Handle Sign
+    if (num0 < 0) {
+        // Convert to unsigned magnitude
+        // Note: -32768 converts to 32768 (0x8000), which is valid for uint16_t
+        num   = (uint16_t)(-num0);
+        minus = '-';
+        width--; // Decrease available width padding
+    } else {
+        num = (uint16_t) num0;
+    }
+
+    // 2. Start Transaction
+    I2C_Start(SSD1306_I2C_ADDR, false);
+    I2C_Transmit(SSD1306_CTRL_DATA); // Data Mode
+
+    // 3. Digit Extraction Loop
+    for (int8_t round = 4; round > 0; --round) {
+        char     ch  = '0';
+        uint16_t pow = pgm_read_word(&pow10_LUT[round]);
+
+        // Subtractive Division (Faster than hardware DIV on ATtiny)
+        while (num >= pow) {
+            num -= pow;
+            ch++;
+        }
+
+        // Rendering Logic
+        if (ch != '0' || width == 0) {
+            // Check if we have a pending minus sign to print first
+            if (minus != 0) {
+                OLED_stream_char(minus);
+                minus = 0; // Clear flag so we don't print it again
+            }
+
+            OLED_stream_char(ch);
+            width = 0; // no more leading spaces
+        } else if (round < width) {
+            // Leading Space Padding
+            OLED_stream_char(' ');
+        }
+    }
+
+    // 4. Final Digit & Final Minus Check
+    // If the number was just "-0" (impossible) or "-5" where loops skipped:
+    if (minus != 0)
+        OLED_stream_char(minus);
+    OLED_stream_char('0' + (uint8_t) num);
+
+    // 5. Stop Transaction
+    I2C_Stop();
+}
+
+// Draws a string at 2x scale (10x14 pixels)
+// Consumes 2 Pages of height.
+void OLED_print_big(uint8_t page, uint8_t col, const char* str) {
+    while (*str) {
+        // Check bounds
+        if (col > 118) break;
+
+        // Get standard 5x7 char data
+        uint8_t c = *str - 32;
+        uint16_t font_idx = c * 5;
+
+        // --- DRAW TOP HALF (Page N) ---
+        OLED_set_cursor(page, col);
+        I2C_Start(SSD1306_I2C_ADDR, false);
+        I2C_Transmit(0x40);
+        for (uint8_t i = 0; i < 5; i++) {
+            uint8_t line = pgm_read_byte(&font5x7_LUT[font_idx + i]);
+            // Stretch Lower Nibble (0000ABCD -> AABBCCDD)
+            uint8_t expanded = 0;
+            if (line & 0x01) expanded |= 0x03;
+            if (line & 0x02) expanded |= 0x0C;
+            if (line & 0x04) expanded |= 0x30;
+            if (line & 0x08) expanded |= 0xC0;
+            // Write twice for width doubling
+            I2C_Transmit(expanded);
+            I2C_Transmit(expanded);
+        }
+        I2C_Transmit(0x00); I2C_Transmit(0x00); // Spacing
+        I2C_Stop();
+
+        // --- DRAW BOTTOM HALF (Page N+1) ---
+        OLED_set_cursor(page + 1, col);
+        I2C_Start(SSD1306_I2C_ADDR, false);
+        I2C_Transmit(0x40);
+        for (uint8_t i = 0; i < 5; i++) {
+            uint8_t line = pgm_read_byte(&font5x7_LUT[font_idx + i]);
+            // Stretch Upper Nibble (0000EFGH -> EEFFGGHH)
+            uint8_t expanded = 0;
+            if (line & 0x10) expanded |= 0x03;
+            if (line & 0x20) expanded |= 0x0C;
+            if (line & 0x40) expanded |= 0x30;
+            if (line & 0x80) expanded |= 0xC0;
+            I2C_Transmit(expanded);
+            I2C_Transmit(expanded);
+        }
+        I2C_Transmit(0x00); I2C_Transmit(0x00);
+        I2C_Stop();
+
+        col += 2; // big glyph is 2 chars wide
+        str++;
+    }
+}
+
+/*
+ * =========================================================================================
+ * QMC5883P MAGNETOMETER SUBSYSTEM
+ * =========================================================================================
+ *
+ * 1. DEVICE OVERVIEW
+ * -----------------------------------------------------------------------------------------
+ * - Part Number: QST QMC5883P (Note: 'P' variant is distinct from 'L')
+ * - I2C Address: 0x2C (7-bit)
+ * - Datasheet:   Rev C (13-52-19)
+ *
+ * 2. POWER MANAGEMENT STRATEGY (SINGLE SHOT)
+ * -----------------------------------------------------------------------------------------
+ * To maximize battery life on a CR2032, this driver avoids "Continuous Mode".
+ * We utilize the hardware's native "Single Mode" (Forced Mode).
+ *
+ * - IDLE:   The sensor sits in SUSPEND mode (~3uA current).
+ * - ACTIVE: The driver writes 'MODE_SINGLE' to Control Register 1.
+ * - ACTION: The sensor Wakes -> Measures -> Updates Data -> Auto-Suspends.
+ *
+ * This provides a fail-safe mechanism: if the microcontroller hangs or crashes,
+ * the sensor will not drain the battery because it automatically returns to sleep.
+ *
+ * 3. STARTUP DEGAUSSING (HARD IRON / DOMAIN ALIGNMENT)
+ * -----------------------------------------------------------------------------------------
+ * Upon initialization, the driver performs a specific "Set/Reset" sequence.
+ * By forcing a "Set Only" pulse followed by restoring normal "Set/Reset", we generate
+ * a strong magnetic field internally. This re-aligns the magnetic domains of the
+ * Permalloy film, canceling out offsets caused by nearby magnetic components (speaker).
+ *
+ * 4. REGISTER MAPPING (0x2C Variant)
+ * -----------------------------------------------------------------------------------------
+ * 0x00: Chip ID
+ * 0x01-0x06: Data Output (X, Y, Z)
+ * 0x09: Status Register
+ * 0x0A: Control Register 1 (Mode, ODR, OSR, OSR2)
+ * 0x0B: Control Register 2 (Soft Reset, Rollover, Interrupt)
+ * =========================================================================================
+ */
+
+// I2C Address
+#define QMC5883P_I2C_ADDR            0x2c
+
+/* =========================================================================
+ *                        REGISTER & ENUM DEFINITIONS
+ * ========================================================================= */
+
+/**
+ * @brief Register Map (Datasheet Page 14)
+ * Note: QMC5883P Control registers are at 0x0A/0x0B (shifted vs QMC5883L)
+ */
+typedef enum {
+    QMC5883P_REG_CHIPID   = 0x00, // Chip ID register
+    QMC5883P_REG_X_LSB    = 0x01, // X-axis output LSB register
+    QMC5883P_REG_X_MSB    = 0x02, // X-axis output MSB register
+    QMC5883P_REG_Y_LSB    = 0x03, // Y-axis output LSB register
+    QMC5883P_REG_Y_MSB    = 0x04, // Y-axis output MSB register
+    QMC5883P_REG_Z_LSB    = 0x05, // Z-axis output LSB register
+    QMC5883P_REG_Z_MSB    = 0x06, // Z-axis output MSB register
+    QMC5883P_REG_STATUS   = 0x09, // Status register
+    QMC5883P_REG_CONTROL1 = 0x0A, // Control register 1 (Mode/ODR/OSR)
+    QMC5883P_REG_CONTROL2 = 0x0B, // Control register 2 (Reset/Config)
+} QMC5883P_register_t;
+
+/**
+ * @brief Status Register Bits (0x09)
+ */
+typedef enum {
+    QMC5883P_STATUS_DRDY = (1 << 0), // Data Ready
+    QMC5883P_STATUS_OVFL = (1 << 1), // Overflow
+} QMC5883P_mode_t;
+
+/**
+ * @brief Control register 1
+ */
+typedef enum {
+    // Operating Mode (Bits 1:0)
+    QMC5883P_MODE_SUSPEND    = 0, // Suspend mode (Low Power, <3uA)
+    QMC5883P_MODE_NORMAL     = 1, // Normal mode (Old term)
+    QMC5883P_MODE_SINGLE     = 2, // Single Measurement (Auto-Sleep)
+    QMC5883P_MODE_CONTINUOUS = 3, // Continuous Read Mode
+
+    // Output Data Rate (Bits 3:2)
+    // In Single Mode, this determines the speed of the one-shot measurement.
+    QMC5883P_ODR_10HZ  = (0 << 2), // 10 Hz output data rate
+    QMC5883P_ODR_50HZ  = (1 << 2), // 50 Hz output data rate
+    QMC5883P_ODR_100HZ = (2 << 2), // 100 Hz output data rate
+    QMC5883P_ODR_200HZ = (3 << 2), // 200 Hz output data rate (Fastest)
+
+    // Over Sample Ratio 1 (Bits 5:4)
+    // Controls bandwidth/noise. Higher OSR = Lower Noise, Higher Current.
+    QMC5883P_OSR_8 = (0 << 4), // OSR = 8 (Best Filtering)
+    QMC5883P_OSR_4 = (1 << 4), // OSR = 4
+    QMC5883P_OSR_2 = (2 << 4), // OSR = 2
+    QMC5883P_OSR_1 = (3 << 4), // OSR = 1 (Lowest Power)
+
+    // Over Sample Ratio 2 / Downsample (Bits 7:6)
+    // Secondary internal filter setting.
+    QMC5883P_OSR2_1 = (0 << 6), // Downsample ratio = 1
+    QMC5883P_OSR2_2 = (1 << 6), // Downsample ratio = 2
+    QMC5883P_OSR2_4 = (2 << 6), // Downsample ratio = 4
+    QMC5883P_OSR2_8 = (3 << 6), // Downsample ratio = 8
+} QMC5883P_control1_t;
+
+/**
+ * @brief Control register 2
+ */
+typedef enum {
+    // Set/Reset Logic (Bits 1:0)
+    // Used for the Degaussing / Domain Alignment sequence.
+    QMC5883P_SETRESET_ON      = 0, // Normal: Set and Reset Pulse On
+    QMC5883P_SETRESET_SETONLY = 1, // Pulse: Set Only (Force logic)
+    QMC5883P_SETRESET_OFF     = 2, // Off: Set and Reset Off
+
+    // Field Range (Bits 3:2)
+	QMC5883P_RANGE_30G = (0 << 2), // +/- 30 Gauss range
+	QMC5883P_RANGE_12G = (1 << 2), // +/- 12 Gauss range
+	QMC5883P_RANGE_8G  = (2 << 2), // +/- 8 Gauss range (Balanced)
+	QMC5883P_RANGE_2G  = (3 << 2), // +/- 2 Gauss range (High Sensitivity)
+
+    // Self test
+    QMC5883P_SELF_TEST  = (1 << 6), // Self test
+    QMC5883P_SOFT_RESET = (1 << 7), // Soft Reset (Reboots chip logic)
+} QMC5883P_control2_t;
+
+/**
+ * @brief Sensor sensitivity LSB/G
+ */
+enum {
+    QMC5883P_SENSITIVITY_2G  = 15000,
+    QMC5883P_SENSITIVITY_8G  = 3750,
+    QMC5883P_SENSITIVITY_12G = 2500,
+    QMC5883P_SENSITIVITY_30G = 1000,
+};
+
+enum {
+    QMC5883P_CONFIG_CONTROL1    = QMC5883P_OSR_8 | QMC5883P_OSR2_8 | QMC5883P_ODR_50HZ,
+    QMC5883P_CONFIG_CONTROL2    = QMC5883P_RANGE_8G,
+    QMC5883P_CONFIG_SENSITIVITY = QMC5883P_SENSITIVITY_8G,
+};
+
+
+/* =========================================================================
+ *                            DATA STRUCTURES
+ * ========================================================================= */
+
+/**
+ * @brief Container for the 3-axis magnetic data.
+ *        units are in milli Gauss
+ */
+struct QMC5883P_data {
+    int16_t x;
+    int16_t y;
+    int16_t z;
+} ;
+
+/* =========================================================================
+ *                           PRIVATE FUNCTIONS
+ * ========================================================================= */
+
+/**
+ * @brief  Writes a byte to a specific register on the QMC5883P.
+ * @details Wrapper for the I2C Write transaction.
+ * @param  reg   Register Address.
+ * @param  data  Value to write.
+ */
+void QMC5883P_cmd(uint8_t reg, uint8_t data) {
+    uint8_t buffer[2];
+
+    buffer[0] = reg;
+    buffer[1] = data;
+    // Uses the I2C subsystem to safely handle Start/Stop/Ack
+    I2C_Write(QMC5883P_I2C_ADDR, buffer, 2);
+}
+
+/* =========================================================================
+ *                           PUBLIC API FUNCTIONS
+ * ========================================================================= */
+
+/**
+ * @brief  Initializes the QMC5883P Sensor.
+ * @details
+ * 1. Performs Soft Reset to clear stuck states.
+ * 2. Runs Degaussing (Set Only -> Set/Reset On) to align magnetic domains.
+ * 3. Configures filters (OSR/ODR) and Range (8G).
+ * 4. Ensures the sensor ends in SUSPEND mode.
+ */
+void QMC5883P_Init(void) {
+    // 1. SOFT RESET
+    // Resets registers to default. Chip enters Suspend Mode automatically.
+    QMC5883P_cmd(QMC5883P_REG_CONTROL2, QMC5883P_SOFT_RESET);
+
+    // Wait for POR (Power On Reset) to complete (~250us per datasheet)
+    _delay_ms(5);
+
+    // 2. DEGAUSSING SEQUENCE (Domain Alignment)
+    // Step A: Configure Range 8G + Force "Set Only" logic
+    QMC5883P_cmd(QMC5883P_REG_CONTROL2, QMC5883P_CONFIG_CONTROL2 | QMC5883P_SETRESET_SETONLY);
+
+    // Allow pulse to settle
+    _delay_ms(2);
+
+    // Step B: Restore "Set/Reset On" logic (Normal Operation)
+    // Keep Range 8G.
+    QMC5883P_cmd(QMC5883P_REG_CONTROL2, QMC5883P_CONFIG_CONTROL2 | QMC5883P_SETRESET_ON);
+
+    // 3. CONFIGURE FILTERS (Control 1)
+    // We configure the filters, but we leave MODE as SUSPEND (0x00).
+    // OSR=512 (Max), OSR2=8 (Max), ODR=200Hz (Fastest single shot)
+    QMC5883P_cmd(QMC5883P_REG_CONTROL1, QMC5883P_CONFIG_CONTROL1 | QMC5883P_MODE_SUSPEND);
+}
+
+/**
+ * @brief  Performs a Single-Shot measurement and reads data.
+ * @details
+ * 1. Wakes sensor by setting MODE_SINGLE.
+ * 2. Waits for measurement completion (Fixed delay).
+ * 3. Reads Data registers.
+ * 4. Sensor automatically returns to SUSPEND mode (Hardware feature).
+ *
+ * @param[out] pData  Pointer to QMC5883P_data_t structure.
+ * @return true if read successful, false if I2C error or device not ready.
+ */
+bool QMC5883P_read(struct QMC5883P_data *pData) {
+    uint8_t buffer[6]; // Buffer for X(2), Y(2), Z(2)
+
+    if (pData == NULL)
+        return false;
+
+    // 1. TRIGGER MEASUREMENT (Single Mode)
+    // Must preserve OSR/ODR settings, but change Mode bits to Single (0x02)
+    QMC5883P_cmd(QMC5883P_REG_CONTROL1, QMC5883P_CONFIG_CONTROL1 | QMC5883P_MODE_SINGLE);
+
+    // 2. WAIT FOR MEASUREMENT
+    // At 200Hz ODR, 1 sample takes ~5ms. We wait 6ms to be safe.
+    _delay_ms(6);
+
+    // 3. READ DATA REGISTERS
+    // Burst read 6 bytes starting from 0x01 (X_LSB)
+    if (I2C_Read(QMC5883P_I2C_ADDR, QMC5883P_REG_X_LSB, buffer, 6) != I2C_STATUS_OK)
+        return false;
+
+    // NOTE: Sensor is now automatically in SUSPEND mode.
+
+    // 4. PARSE DATA
+    // Data is Little Endian (LSB at lower address).
+    // Explicit casting ensures 16-bit reconstruction before signed interpretation.
+    // Order: X_LSB, X_MSB, Y_LSB, Y_MSB, Z_LSB, Z_MSB
+
+    pData->x = (int16_t)(buffer[0] | ((uint16_t) buffer[1] << 8));
+    pData->y = (int16_t)(buffer[2] | ((uint16_t) buffer[3] << 8));
+    pData->z = (int16_t)(buffer[4] | ((uint16_t) buffer[5] << 8));
+
+    // convert units to milli Gauss
+    pData->x = (int32_t) pData->x * 1000 / QMC5883P_CONFIG_SENSITIVITY;
+    pData->y = (int32_t) pData->y * 1000 / QMC5883P_CONFIG_SENSITIVITY;
+    pData->z = (int32_t) pData->z * 1000 / QMC5883P_CONFIG_SENSITIVITY;
+
+    return true;
+}
+
+////////////////////////////
+
+#define BME280_ADDR         0x76 // Check your module: 0x76 (SDO=GND) or 0x77 (SDO=VCC)
+
+// Registers
+#define BME280_REG_DIG_T1   0x88 // Start of Temp Calibration
+#define BME280_REG_ID       0xD0
+#define BME280_REG_CTRL     0xF4 // Control Measurement
+#define BME280_REG_TEMP     0xFA // Temp MSB
+// Add Pressure Registers
+#define BME280_REG_DIG_P1   0x8E
+#define BME280_REG_PRESS    0xF7 // Pressure MSB
+// Add Humidity Registers
+#define BME280_REG_CTRL_HUM 0xF2
+#define BME280_REG_HUM_MSB  0xFD
+
+typedef struct {
+    // Temp (0x88)
+    uint16_t dig_T1;
+    int16_t  dig_T2;
+    int16_t  dig_T3;
+    // Pressure (0x8E)
+    uint16_t dig_P1;
+    int16_t  dig_P2; int16_t  dig_P3; int16_t  dig_P4;
+    int16_t  dig_P5; int16_t  dig_P6; int16_t  dig_P7;
+    int16_t  dig_P8; int16_t  dig_P9;
+
+    // Humidity (Fragmented)
+    uint8_t  dig_H1; // 0xA1
+    int16_t  dig_H2; // 0xE1
+    uint8_t  dig_H3; // 0xE3
+    int16_t  dig_H4; // 0xE4 + 0xE5[3:0]
+    int16_t  dig_H5; // 0xE6 + 0xE5[7:4]
+    int8_t   dig_H6; // 0xE7
+} bme280_calib_t;
+
+static bme280_calib_t calib;
+static int32_t t_fine; // Needs to be static global now
+
+void BME280_Init(void) {
+    uint8_t buffer[26];
+
+    // --- 1. Load T/P Calibration (0x88 - 0x9F) ---
+    I2C_Read(BME280_ADDR, 0x88, buffer, 24);
+    // ... [Parse T1-T3, P1-P9 as before] ...
+    calib.dig_T1 = (uint16_t)((buffer[1] << 8) | buffer[0]);
+    calib.dig_T2 = (int16_t)((buffer[3] << 8) | buffer[2]);
+    calib.dig_T3 = (int16_t)((buffer[5] << 8) | buffer[4]);
+    calib.dig_P1 = (uint16_t)((buffer[7] << 8) | buffer[6]);
+    calib.dig_P2 = (int16_t)((buffer[9] << 8) | buffer[8]);
+    calib.dig_P3 = (int16_t)((buffer[11]<< 8) | buffer[10]);
+    calib.dig_P4 = (int16_t)((buffer[13]<< 8) | buffer[12]);
+    calib.dig_P5 = (int16_t)((buffer[15]<< 8) | buffer[14]);
+    calib.dig_P6 = (int16_t)((buffer[17]<< 8) | buffer[16]);
+    calib.dig_P7 = (int16_t)((buffer[19]<< 8) | buffer[18]);
+    calib.dig_P8 = (int16_t)((buffer[21]<< 8) | buffer[20]);
+    calib.dig_P9 = (int16_t)((buffer[23]<< 8) | buffer[22]);
+
+    // --- 2. Load Humidity Calibration (Fragmented) ---
+    // H1 is alone at 0xA1
+    I2C_Read(BME280_ADDR, 0xA1, &calib.dig_H1, 1);
+
+    // H2-H6 are at 0xE1 to 0xE7 (7 bytes)
+    uint8_t h_buff[7];
+    I2C_Read(BME280_ADDR, 0xE1, h_buff, 7);
+
+    calib.dig_H2 = (int16_t)((h_buff[1] << 8) | h_buff[0]); // 0xE1-E2
+    calib.dig_H3 = h_buff[2];                               // 0xE3
+
+    // H4 is 0xE4 (MSB) + 0xE5 (lower 4 bits)
+    // FIX: Cast MSB to (int8_t) first to enforce sign extension
+    calib.dig_H4 = (int16_t)((((int8_t)h_buff[3]) << 4) | (h_buff[4] & 0x0F));
+
+    // H5 is 0xE6 (MSB) + 0xE5 (upper 4 bits)
+    // FIX: Cast MSB to (int8_t) first
+    calib.dig_H5 = (int16_t)((((int8_t)h_buff[5]) << 4) | (h_buff[4] >> 4));
+
+    calib.dig_H6 = (int8_t)h_buff[6]; // 0xE7 (Signed char)
+
+    // --- 3. Configure (Strict Order) ---
+
+    // Step A: Set Humidity Oversampling (x1) to Reg 0xF2
+    uint8_t ctrl_hum[] = { 0xF2, 0x01 };
+    I2C_Transmit(BME280_ADDR, ctrl_hum, 2);
+
+    // Step B: Set Temp/Press Oversampling + Mode to Reg 0xF4
+    // Note: Writing this register activates the changes in ctrl_hum
+    uint8_t ctrl_meas[] = { 0xF4, 0x27 }; // Normal Mode, x1 Temp, x1 Press
+    I2C_Transmit(BME280_ADDR, ctrl_meas, 2);
+
+    // Step C: Config (Standby 1000ms)
+    uint8_t config[] = { 0xF5, 0xA0 };
+    I2C_Transmit(BME280_ADDR, config, 2);
+}
+
+void BME280_Sleep(void) {
+    // Register 0xF4 (ctrl_meas)
+    // Mode 00 = Sleep
+    // We write 0x00 to turn off Oversampling and Mode
+    uint8_t data[] = { 0xF4, 0x00 };
+    I2C_Transmit(BME280_ADDR, data, 2);
+}
+
+void BME280_Wake(void) {
+    // We do NOT need to reload calibration.
+    // Just restore the config to run a measurement.
+    // Reg 0xF4: x1 Temp (001), x1 Press (001), Normal Mode (11) -> 0x27
+    // Or Forced Mode (01) -> 0x25
+    uint8_t data[] = { 0xF4, 0x27 };
+    I2C_Transmit(BME280_ADDR, data, 2);
+}
+
+int16_t BME280_ReadTemp(void) {
+    uint8_t buffer[3];
+    int32_t adc_T, var1, var2, T;
+
+    // 1. Read Raw ADC (FA, FB, FC)
+    I2C_Read(BME280_ADDR, BME280_REG_TEMP, buffer, 3);
+
+    // 2. Combine bytes (20-bit resolution)
+    // MSB << 12 | LSB << 4 | XLSB >> 4
+    adc_T = ((int32_t)buffer[0] << 12) | ((int32_t)buffer[1] << 4) | ((int32_t)buffer[2] >> 4);
+
+    // 3. Compensation Formula (Source: Bosch Datasheet)
+    // This math is unavoidable. It maps the raw ADC to actual voltage/temp curves.
+
+    var1 = ((((adc_T >> 3) - ((int32_t)calib.dig_T1 << 1))) * ((int32_t)calib.dig_T2)) >> 11;
+
+    var2 = (((((adc_T >> 4) - ((int32_t)calib.dig_T1)) *
+          ((adc_T >> 4) - ((int32_t)calib.dig_T1))) >> 12) *
+        ((int32_t)calib.dig_T3)) >> 14;
+
+    t_fine = var1 + var2; // t_fine carries the fine resolution temp for Pressure calc
+
+    T = (t_fine * 5 + 128) >> 8;
+
+    return (int16_t)T; // Returns temperature in degC * 100
+}
+
+uint32_t BME280_ReadPressure(void) {
+    uint8_t buffer[3];
+    int32_t adc_P, var1, var2;
+    uint32_t p;
+
+    // 1. Read Raw Pressure (F7, F8, F9)
+    I2C_Read(BME280_ADDR, BME280_REG_PRESS, buffer, 3);
+
+    adc_P = ((int32_t)buffer[0] << 12) | ((int32_t)buffer[1] << 4) | ((int32_t)buffer[2] >> 4);
+
+    // 2. Compensation (Bosch 32-bit formula)
+    var1 = (((int32_t)t_fine) >> 1) - (int32_t)64000;
+
+    var2 = (((var1 >> 2) * (var1 >> 2)) >> 11 ) * ((int32_t)calib.dig_P6);
+    var2 = var2 + ((var1 * ((int32_t)calib.dig_P5)) << 1);
+    var2 = (var2 >> 2) + (((int32_t)calib.dig_P4) << 16);
+
+    var1 = (((calib.dig_P3 * (((var1 >> 2) * (var1 >> 2)) >> 13 )) >> 3) +
+        ((((int32_t)calib.dig_P2) * var1) >> 1)) >> 18;
+
+    var1 = ((((32768 + var1)) * ((int32_t)calib.dig_P1)) >> 15);
+
+    // Division by zero protection (if P1 is empty/error)
+    if (var1 == 0) {
+        return 0;
+    }
+
+    p = (((uint32_t)(((int32_t)1048576) - adc_P) - (var2 >> 12))) * 3125;
+
+    if (p < 0x80000000) {
+        p = (p << 1) / ((uint32_t)var1);
+    } else {
+        p = (p / (uint32_t)var1) * 2;
+    }
+
+    var1 = (((int32_t)calib.dig_P9) * ((int32_t)(((p >> 3) * (p >> 3)) >> 13))) >> 12;
+    var2 = (((int32_t)(p >> 2)) * ((int32_t)calib.dig_P8)) >> 13;
+
+    p = (uint32_t)((int32_t)p + ((var1 + var2 + calib.dig_P7) >> 4));
+
+    return p; // Returns Pressure in Pascals (e.g., 100000)
+}
+
+uint16_t BME280_ReadHumidity(void) {
+    uint8_t buffer[2];
+    int32_t adc_H;
+    int32_t v_x1_u32r;
+
+    // 1. Read Raw Humidity
+    I2C_Read(BME280_ADDR, BME280_REG_HUM_MSB, buffer, 2);
+    adc_H = ((int32_t)buffer[0] << 8) | ((int32_t)buffer[1]);
+
+    // 2. Compensation (Bosch Formula)
+    v_x1_u32r = (t_fine - ((int32_t)76800));
+
+    v_x1_u32r = (((((adc_H << 14) - (((int32_t)calib.dig_H4) << 20) -
+            (((int32_t)calib.dig_H5) * v_x1_u32r)) + ((int32_t)16384)) >> 15) *
+             (((((((v_x1_u32r * ((int32_t)calib.dig_H6)) >> 10) *
+              (((v_x1_u32r * ((int32_t)calib.dig_H3)) >> 11) + ((int32_t)32768))) >> 10) +
+            ((int32_t)2097152)) * ((int32_t)calib.dig_H2) + 8192) >> 14));
+
+    v_x1_u32r = (v_x1_u32r - (((((v_x1_u32r >> 15) * (v_x1_u32r >> 15)) >> 7) *
+                   ((int32_t)calib.dig_H1)) >> 4));
+
+    // Clamp to 0..100% range in standard Q22 format
+    if (v_x1_u32r < 0) v_x1_u32r = 0;
+    if (v_x1_u32r > 419430400) v_x1_u32r = 419430400;
+
+    // 3. SCALING: Convert Q22.10 (1024=1%) to Centi-percent (100=1%)
+    // Logic: (Value >> 12) gets us the 1024-scale.
+    // Multiply by 25 and divide by 256 (>>8) converts 1024 -> 100.
+
+    uint32_t raw_1024 = (uint32_t)(v_x1_u32r >> 12);
+    uint32_t final_h = (raw_1024 * 25) >> 8;
+
+    return (uint16_t)final_h; // Returns 0 to 10000
+}
+
+////////////////////////////
+
+// Fresh: > 2.9V
+// Nominal: 2.8V
+// Weak: 2.6V (OLED might dim/flicker)
+// Dead: < 2.4V (Brown-out reset likely)
+
+// Measure Supply Voltage in millivolts (e.g., 3000 = 3.0V)
+uint16_t get_battery_mv() {
+    // 1. Configure ADMUX
+    // REFS[2:0] = 000 (VCC used as Reference)
+    // MUX[3:0]  = 1100 (Measure Internal 1.1V Bandgap)
+    ADMUX = (0 << REFS1) | (0 << REFS0) | (1 << MUX3) | (1 << MUX2);
+
+    // 2. Enable ADC + Set Prescaler to 64 (125kHz @ 8MHz)
+    // ADCSRA = Enable | Start | Prescaler
+    ADCSRA = (1 << ADEN) | (1 << ADPS2) | (1 << ADPS1);
+
+    // 3. Stabilization Delay
+    // The bandgap takes a moment to stabilize.
+    // We can just burn a dummy reading.
+    ADCSRA |= (1 << ADSC); // Start first conversion
+    while (ADCSRA & (1 << ADSC)); // Wait
+
+    // 4. Real Measurement
+    ADCSRA |= (1 << ADSC); // Start second conversion
+    while (ADCSRA & (1 << ADSC)); // Wait
+
+    // 5. Calculate VCC
+    // Formula: VCC = (1.1V * 1024) / ADC_Value
+    // Using 1100mV * 1024 = 1126400
+    // Note: The Bandgap varies slightly chip-to-chip (1.0V - 1.2V).
+    // Calibration Constant: 1126400L (Default)
+    uint16_t adc_val = ADC;
+
+    // Disable ADC to save power immediately
+    ADCSRA &= ~(1 << ADEN);
+
+    if (adc_val == 0) return 0; // Prevent divide by zero
+    return (uint16_t)(1126400L / adc_val);
+}
+
+////////////////////////////
+
+int angle;
+struct QMC5883P_data qmc_data;
+
+void loopUI() {
+    if (QMC5883P_read(&qmc_data)) {
+        int16_t heading_deg = atan2_deg(qmc_data.y, qmc_data.x);
+
+        // OLED_set_cursor(0, 40);
+        // OLED_print_uint(heading_deg);
+
+        OLED_set_cursor(0, 14);
+        OLED_string("X");
+        OLED_print_int(qmc_data.x, 4);
+        OLED_string("mG");
+
+        OLED_set_cursor(1, 14);
+        OLED_string("Y");
+        OLED_print_int(qmc_data.y, 4);
+        OLED_string("mG");
+
+        OLED_set_cursor(2, 14);
+        OLED_string("Z");
+        OLED_print_int(qmc_data.z, 4);
+        OLED_string("mG");
+
+        char strbuf[10];
+        OLED_sprint_uint(strbuf, heading_deg, 3);
+        OLED_print_big(1, 6, strbuf);
+        OLED_print_big(1, 6 + 3 * 2, "\x7f"); //  above is 3 double cell wide
+
+        OLED_draw_compass(0, 0, -heading_deg);
+    }
+
+    int16_t temp = BME280_ReadTemp();
+    OLED_set_cursor(4, 0);
+    OLED_string("Temp:");
+    OLED_print_int(temp / 100, 4);
+    OLED_string(".");
+    OLED_print_int(temp % 100, 2);
+    OLED_string(" \x7f" "C"); // split ° and C
+
+#if 1
+    uint32_t p_pa = BME280_ReadPressure(); // e.g. 101325 (Pa)
+    OLED_set_cursor(5, 0);
+    OLED_string("Baro:");
+    OLED_print_int(p_pa / 100, 4);
+    OLED_string(".");
+    OLED_print_int(p_pa % 100, 2);
+    OLED_string(" hPa");
+
+    int16_t hum = BME280_ReadHumidity();
+    OLED_set_cursor(6, 0);
+    OLED_string("Hum :");
+    OLED_print_int(hum / 100, 4);
+    OLED_string(".");
+    OLED_print_int(hum % 100, 2);
+    OLED_string(" %");
+
+    int16_t bat = Battery_GetVoltage();
+    OLED_set_cursor(7, 0);
+    OLED_string("Bat :");
+    OLED_print_int(bat / 1000, 3);
+    OLED_string(".");
+    OLED_print_int(bat % 1000, 3);
+    OLED_string(" V");
+  #endif
+}
+
+// =================================================================================
+// === YOUR CONTROLS - THE ONLY PART YOU NEED TO CHANGE! ===========================
+// =================================================================================
+
+/*
+================================================================================
+ATtiny85 v2 Pin Mapping — Multiplexed Design
+================================================================================
+Physical Pin | Port/Bit | Mode / Usage           | Attached Device / Notes
+-------------|----------|------------------------|------------------------
+1            | PB5      | RESET                  | ISP reset; standard programming
+2            | PB3      | OUTPUT                 | Piezo (+), differential drive with PB4
+3            | PB4      | OUTPUT                 | Piezo (–), complementary to PB3
+4            | GND      | —                      | Ground
+5            | PB0      | I2C SDA                | I2C bus, pull-ups recommended
+6            | PB1      | MULTIPLEXED            | LED drive, Switch read, ISP MISO
+7            | PB2      | I2C SCL                | I2C bus, pull-ups recommended
+8            | VCC      | —                      | Power 3.3–5 V
+================================================================================
+
+PB1 (Physical 6) Multiplexed Logic:
+Circuit: VCC - R1 (2K) - LED - pin6 - SWITCH - R2 (1K) - GND
+
+Mode                     | PinMode     | Physics / Current Path                  | Function
+-------------------------|-------------|-----------------------------------------|-------------------------
+Programming / Idle       | INPUT       | Pin floats HIGH; programmer drives LOW  | ISP MISO
+Switch Released          | INPUT       | VCC - R1 - LED - pin6                   | pin6 pullup, Detect VCC - HIGH
+Switch Pressed           | INPUT       | VCC - R1 - LED - pin6 - R2 - GND        | Detect R2/(R1+R2) - LOW
+LED ON                   | OUTPUT LOW  | VCC - R1 - LED - pin6=GND - R2 - GND    | LED lights up, pin6 sinks current
+LED OFF                  | OUTPUT HIGH | VCC - R1 - LED - pin6=VCC - R2 → GND    | LED off, pin6 sources current
+================================================================================================================
+Notes:
+- Piezo differential drive doubles voltage swing without extra hardware.
+- I2C lines (PB0/PB2) must be idle during programming.
+- R1/R2 + LED forward voltage maintain safe logic levels at 3.3–5 V.
+- Dynamic pinMode management allows safe multiplexing between LED, switch, and programming.
+*/
+
+const byte SPEAKER_PIN = PB4;  // chip pin 3
+const byte LED_PIN = 3;        // chip pin 5
+const byte SWITCH_PIN = PB1;   // chip pin 6
+const byte SDA_PIN = PB0;      // chip pin 5
+const byte SCL_PIN = PB2;      // chip pin 7
+
+// --- EFFECT "SEASONING" ---
+// These are the fun numbers you can change to be a "sound designer"!
+// Try changing them and see what happens to the final effect.
+int   throbSpeed      = 7;  // How fast the LED fades. Try 2.0 (slow) or 10.0 (fast)!
+int   startFrequency  = 800; // The starting pitch of the sound (in Hertz).
+int   endFrequency    = 1800;// The ending pitch of the sound.
+int   sweepDuration   = 700; // How many milliseconds the sound takes to slide up.
+int   warbleDepth     = 30;  // How "wobbly" the sound is. Try 10 for subtle, 100 for crazy!
+int   warbleSpeed     = 25;  // How fast the wobble is. Lower numbers are faster!
+
+/*
+ * =========================================================================================
+ * SOUND SUBSYSTEM
+ * =========================================================================================
+ */
+
+//
+// DEEP DIVE: HOW THE SONIC SCREWDRIVER SOUND WORKS
+//
+//
+// The function below, updateSonicWarble(), is the heart of our sound effect.
+// It's a fantastic example of how you can create complex results from simple tools.
+//
+// --- The First Tool: The map() Function ---
+//
+// The map() function is like a magical stretching machine. It takes a number from
+// one range and perfectly scales it to fit into a new range.
+//
+// The command looks like this:
+//   newNumber = map(inputValue, fromLow, fromHigh, toLow, toHigh);
+//
+// For example, if you have a value of 50 in a range of 0-100, and you want to map
+// it to a new range of 0-1000, map() would give you 500. It's a translator for numbers.
+//
+// --- The Second Tool: The tone() Function ---
+//
+// The tone() function is like a musician who lives inside the chip. You tell it:
+//   tone(pin, frequency);
+// ...and it will start playing that exact musical note (frequency) on that pin.
+// The best part? It plays in the background! Your main loop() code can keep running
+// and doing other things while the musician plays their note.
+// To stop the sound, you have to command it with noTone(pin);
+//
+// --- The Recipe: Layering Two "Songs" ---
+//
+// Our code uses map() twice to create two different "songs" at the same time.
+//
+//  SONG #1: THE SWEEP
+//  This is a slow, single slide up in pitch. It's a "single-cycle sawtooth wave".
+//  The code for it is:
+//    baseFrequency = map(timeSinceStart, 0, 700, 800, 1800);
+//  It takes the time (from 0 to 700ms) and translates it to a frequency
+//  (from 800Hz to 1800Hz), creating a smooth upward slide.
+//
+//  Frequency ^
+//            |         /-----------
+//            |        /
+//            |       /
+//            |      /
+//   StartFreq +-----/
+//            |
+//            +----------------> Time (0 to 700ms)
+//
+//  SONG #2: THE WARBLE
+//  This is a fast, repeating "wobble" that rides on top of the sweep.
+//  The code for it is:
+//    warble = map(timeSinceStart % 25, 0, 25, -30, 30);
+//  The "%" is a math trick that creates a counter that repeats very quickly (0-24).
+//  We map this fast counter to a range of -30 to +30. This creates the wobble.
+//
+//  Offset ^
+//         |   /\  /\  /\  /\  /
+//         |  /  \/  \/  \/  \/
+//         | /
+//         +/----------------> Time
+//         |/
+//         |\  /\  /\  /\  /\  /
+//         | \/  \/  \/  \/  \/
+//
+// THE FINAL PERFORMANCE:
+// The last line of the function, `tone(SPEAKER_PIN, baseFrequency + warble);`,
+// simply ADDS the two songs together! The fast wobble rides on top of the slow
+// sweep, and sends the final, complex note to the speaker.
+//
+// =================================================================================
+
+unsigned long effectStartTime = 0; // Remembers the exact moment (in milliseconds) the effects were turned on.
+
+// This function creates the Doctor Who WARBLE sound.
+void updateSonicWarble() {
+
+	// Get the current time since the button was pressed.
+	long timeSinceStart = millis() - effectStartTime;
+
+	// --- Create SONG #1: The Sweep ---+
+	long baseFrequency;
+	if (timeSinceStart >= sweepDuration) {
+		// If the sweep time is over, just hold the pitch at the end frequency.
+		baseFrequency = endFrequency;
+	} else {
+		// Otherwise, use map() to calculate the current pitch of the upward slide.
+		baseFrequency = map(timeSinceStart, 0, sweepDuration, startFrequency, endFrequency);
+	}
+
+	// --- Create SONG #2: The Warble ---
+	// Use the fast-repeating counter and map() to create the wobble.
+	int warble = map(timeSinceStart % warbleSpeed, 0, warbleSpeed, -warbleDepth, warbleDepth);
+
+	// --- THE FINAL PERFORMANCE ---
+	// Add the two songs together and tell the 'musician' to play the new note.
+	tone(SPEAKER_PIN, baseFrequency + warble);
+}
+
+// This function creates the smooth THROB effect for the LED.
+void updateLedThrob() {
+#if 0
+  float elapsedTime = (millis() - effectStartTime) / 1000.0;
+  float sinValue = sin(elapsedTime * throbSpeed);
+  int brightness = (int)(((sinValue + 1.0) / 2.0) * 255);
+#else
+  unsigned long elapsedMillis = millis() - effectStartTime;
+  int deg = (int) (elapsedMillis * throbSpeed);
+  int brightness = sin_deg(deg) + 127;  // returns -127..127
+#endif
+
+
+  analogWrite(LED_PIN, brightness);
+
+// TCCR1 = _BV(PWM1A) | _BV(CS10);
+// GTCCR = _BV(COM1A1);
+// OCR1A = brightness;
+}
+
+/*
+================================================================================
+  ||                                                                       ||
+  ||                    PROJECT: ATtiny85 "Sonic Screwdriver"              ||
+  ||          A Beginner's Guide to Lights, Sound, and Microcontrollers    ||
+  ||                                                                       ||
+================================================================================
+
+  AUTHOR: Your Name Here (with an AI Sparring Partner)
+  DATE: Today's Date
+
+  --- THE BIG IDEA (THE "BRIDGE") ---
+
+  Welcome! This project is a recipe for turning a tiny computer chip, the ATtiny85,
+  into a fun sci-fi gadget. When you press a button, it will create a cool,
+  pulsing light and a complex "warbling" sound effect, just like a sonic
+  screwdriver from Doctor Who.
+
+  This single file contains everything you need: the wiring guide, the fully
+  explained code, and a deep dive into the "magic" that makes it all work.
+  Read the comments carefully; they are the lesson!
+
+  --- A VERY IMPORTANT NOTE ON PROGRAMMING (THE "RULES OF THE ROAD") ---
+
+  Our project is so advanced that it uses special pins on the chip that are ALSO
+  used for programming! This is like using the mechanic's service port on your
+  car as the place to plug in your radio. It works, but you have to be careful.
+
+  CRITICAL OPERATIONAL WARNING:
+  To make this project work, you MUST NOT try to upload new code to the chip
+  while the push button is being held down. The chip will be "busy" using the
+  programming pins, and the upload will fail. Always make sure the button is
+  released before you try to program the chip.
+
+*/
+
+/*
+================================================================================
+Arduino as ISP — ATtiny85 Low-Voltage Programming Tweak
+================================================================================
+Background:
+------------
+When programming an ATtiny85 powered at 3.3 V using "Arduino as ISP", uploads may
+fail due to the Arduino's 5 V SPI signals being too fast for the slower, low-voltage
+ATtiny clock. Typical errors include verification mismatches or "programmer not responding".
+
+Solution:
+---------
+Modify the "Arduino as ISP" sketch to slow down the SPI clock:
+
+    // Configure SPI clock (in Hz)
+    // Must be slow enough for ATtiny @ 1 MHz (or low voltage)
+    #define SPI_CLOCK (1000000 / 20)
+
+Explanation:
+------------
+- The ATtiny85 datasheet specifies that SPI clock pulse width must exceed 2 CPU cycles.
+- Using f_CPU / 6 gives a safe margin for low-voltage operation (3.3 V) and slow clock.
+- This tweak prevents upload errors like:
+      avrdude: verification error, first mismatch at byte 0x0006
+      avrdude: programmer is not responding
+
+Implementation:
+---------------
+1. Open "ArduinoISP" sketch in Arduino IDE.
+2. Add or replace the line for SPI_CLOCK as shown above.
+3. Upload the sketch to the Arduino board used as programmer.
+4. Program the ATtiny85 at 3.3 V VCC.
+
+Notes / Safety:
+---------------
+- No external level shifters are needed.
+- Always release the ATtiny's push-button or multiplexed pins during programming.
+- This change only affects the Arduino ISP programmer; your main ATtiny sketch
+  does not require modification.
+================================================================================
+*/
+
+
+
+
+// =================================================================================
+// === THE REST OF THE CODE - THE MAIN RECIPE ======================================
+// =================================================================================
+
+// --- State Management Variables (The Chip's "Memory") ---
+// These variables help the chip remember what it's supposed to be doing from one
+// moment to the next.
+bool effectsActive = false;      // Remembers if the effects are currently ON or OFF.
+byte lastButtonState = HIGH;     // Remembers if the button was pressed or not on the very last loop.
+
+
+// The setup() function is the first part of our recipe.
+// It runs only ONCE, when the chip first gets power. Its job is to get things ready.
+void setup() {
+      I2C_Init();         // Set SDA/SCL to Float/High-Z ONCE
+
+    // 2. Hardware Stabilization
+    // Give voltage time to stabilize before talking to chips
+    _delay_ms(50);
+
+    // // 3. Device Init
+    // SSD1306_Init();        // Configure Screen
+    // QMC5883P_Init();     // Configure Sensor
+    // BME280_Init();
+
+    // // 4. Initial Screen Draw
+    // SSD1306_Clear();
+    // SSD1306_Wake();
+
+}
+
+// This function is called when you press the button. Its job is to activate the sonic screwdriver
+void turnEffectsOn() {
+    // Now we perform our "just-in-time" pin configuration.
+    // Only at the moment the button is pressed do we take control of the special pins.
+    pinMode(SPEAKER_PIN, OUTPUT);
+    pinMode(LED_PIN, OUTPUT);
+    pinMode(SDA_PIN, OUTPUT);
+    pinMode(SCL_PIN, OUTPUT);
+
+    // 3. Device Init
+    SSD1306_Init();  // Configure Screen
+    QMC5883P_Init(); // Configure Compass
+    BME280_Init();   // Configure Sensor
+
+    // 4. Initial Screen Draw
+    SSD1306_Clear();
+    SSD1306_Wake();
+}
+
+// This function is called when you release the button. Its job is to deactivate the sonic screwdriver
+void turnEffectsOff() {
+  SSD1306_Sleep();
+  noTone(SPEAKER_PIN); // sound off
+  digitalWrite(LED_PIN, LOW); // led off
+
+  // This is the most critical part for making our project programmable.
+  // We release our control of the special programming pins, making them "safe"
+  // and ready for the next time you want to upload code.
+  pinMode(SPEAKER_PIN, INPUT);
+  pinMode(LED_PIN, INPUT);
+  pinMode(SDA_PIN, INPUT);
+  pinMode(SCL_PIN, INPUT);
+}
+
+// The loop() function is the main part of our recipe.
+// After setup() is finished, the chip runs this code over and over and over,
+// thousands of times per second, forever!
+void loop() {
+
+    // --- Step 1: Edge detection ---
+    bool currentButtonState = digitalRead(SWITCH_PIN);
+    bool pressed  = (currentButtonState == LOW && lastButtonState != LOW);
+    bool released = (currentButtonState != LOW && lastButtonState == LOW);
+
+    // --- Step 2: Activate or deactivate effects ---
+
+  // This is called "edge detection". It checks for the *exact moment* you press the button.
+  // It's only true if the button is LOW now, AND it was HIGH on the last loop.
+  if (pressed) {
+    effectsActive = true;       // We "remember" that the effects should be ON.
+    effectStartTime = millis(); // We record this exact moment as our start time.
+    turnEffectsOn();
+  }
+
+  // This checks for the *exact moment* you release the button.
+  if (released) {
+    effectsActive = false; // We "remember" that the effects should be OFF.
+    turnEffectsOff();    // We call our special function to turn everything off and clean up.
+  }
+
+  // --- Step 3: Run the effects (if they are supposed to be on) ---
+  if (effectsActive) {
+
+    // This is the core of our project! If the effects are active, we run the
+    // functions that update the light and sound. Because this loop runs thousands
+    // of times per second, we are giving the light and sound a tiny update
+    // on each pass, creating the illusion of a smooth, continuous effect.
+    updateLedThrob();      // ...run the smooth throb function.
+    updateSonicWarble(); // The sound function runs in either mode.
+
+    loopUI();
+  }
+
+  lastButtonState = currentButtonState; // update history
+
+} // End of the loop() function. It now starts over from the very top!
