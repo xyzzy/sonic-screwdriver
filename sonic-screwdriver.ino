@@ -4,6 +4,8 @@
 #include <avr/pgmspace.h>
 #include <avr/io.h>
 #include <util/delay.h>
+#include <avr/sleep.h>
+#include <avr/interrupt.h>
 #include "clion_compat.h"
 
 /*
@@ -2338,6 +2340,77 @@ void loopUI() {
   #endif
 }
 
+/*
+ * =============================================================================
+ *                    ATTiny85 sleep/standby for low power consumption
+ * BATTERY LIFE ESTIMATION (ATtiny85 + SSD1306 + QMC5883P + BME280 + LED)
+ * =============================================================================
+ *
+ * Components:
+ *   - ATtiny85 MCU
+ *   - SSD1306 OLED
+ *   - Status LED
+ *   - QMC5883P magnetometer
+ *   - BME280 environmental sensor
+ *
+ * Typical currents at 3V:
+ * -----------------------
+ * Sleep Mode (power-down, minimal usage):
+ *   - ATtiny85: 0.5 µA
+ *   - SSD1306: 0 µA (powered down)
+ *   - LED: 0 µA (off)
+ *   - QMC5883P: 1 µA (shutdown)
+ *   - BME280: 0.1 µA (low-power)
+ *   -> Total sleep current: I_sleep ≈ 1.6 µA ≈ 0.0016 mA
+ *
+ * Active Mode (everything running):
+ *   - ATtiny85: 5 mA
+ *   - SSD1306: 15 mA
+ *   - LED: 5 mA
+ *   - QMC5883P: 0.1 mA
+ *   - BME280: 0.03 mA
+ *   -> Total active current: I_active ≈ 25.13 mA
+ *
+ * Battery: CR2032, typical capacity 225 mAh
+ *
+ * ============================================================================
+ * MAXIMUM BATTERY LIFE (full sleep, everything off except MCU + sensors in low power)
+ * ============================================================================
+ * I_sleep = 0.0016 mA
+ * Battery life ≈ Capacity / Current
+ * Battery life ≈ 225 mAh / 0.0016 mA ≈ 140,625 hours
+ * Convert to years: 140,625 / 24 / 365 ≈ 16 years (!!)
+ * Note: This is theoretical; real-world factors like self-discharge, leakage,
+ *       and temperature reduce practical life.
+ *
+ * ============================================================================
+ * MINIMUM BATTERY LIFE (full active, everything running continuously)
+ * ============================================================================
+ * I_active = 25.13 mA
+ * Battery life ≈ 225 mAh / 25.13 mA ≈ 8.95 hours
+ *
+ * =============================================================================
+ */
+
+// Note: On ATtiny85, all pin changes (PCINT0 to PCINT5)
+// trigger the SAME vector: PCINT0_vect.
+ISR(PCINT0_vect) {
+  // This code runs immediately upon wake-up.
+  // You can leave this empty if you just want to wake up.
+}
+
+void go_to_sleep(void) {
+  PCMSK |= (1 << PCINT1);               // Enable PCINT1
+  GIMSK |= (1 << PCIE);                 // Enable pin change interrupts globally
+  set_sleep_mode(SLEEP_MODE_PWR_DOWN);  // lowest power mode
+  sleep_enable();                       // allow sleep
+  sleep_bod_disable();
+  sei();                                // ensure interrupts enabled
+  sleep_cpu();                          // MCU sleeps here
+  sleep_disable();                      // resumes here after wake
+  PCMSK &= ~(1 << PCINT1);               // Disable PCINT1
+}
+
 // =================================================================================
 // === YOUR CONTROLS - THE ONLY PART YOU NEED TO CHANGE! ===========================
 // =================================================================================
@@ -2769,12 +2842,16 @@ void loop() {
   // It's only true if the button is LOW now, AND it was HIGH on the last loop.
   if (pressed) {
     effectStartTime = millis(); // We record this exact moment as our start time.
-    turnEffectsOn();
+    turnEffectsOn(); // turn everything on
   }
 
   // This checks for the *exact moment* you release the button.
   if (released) {
-    turnEffectsOff();    // We call our special function to turn everything off and clean up.
+    turnEffectsOff(); // turn everything off
+    // here the button has been released
+    go_to_sleep();
+    // will reach here after button has been pressed
+    // Note that currentButtonState=HIGH
   }
 
   // --- Step 3: Run the effects (if they are supposed to be on) ---
