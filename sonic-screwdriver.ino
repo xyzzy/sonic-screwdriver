@@ -6,6 +6,7 @@
 #include <util/delay.h>
 #include <avr/sleep.h>
 #include <avr/interrupt.h>
+#include <avr/power.h>
 #include "clion_compat.h"
 
 /*
@@ -2288,6 +2289,9 @@ ISR(PCINT0_vect) {
 }
 
 void go_to_sleep(void) {
+  ADCSRA &= ~(1 << ADEN);               // Disable ADC
+  ACSR |= (1 << ACD);                   // Disable analog comparator
+  power_all_disable();                  // Disable all peripherals
   PCMSK |= (1 << PCINT1);               // Enable PCINT1
   GIMSK |= (1 << PCIE);                 // Enable pin change interrupts globally
   set_sleep_mode(SLEEP_MODE_PWR_DOWN);  // lowest power mode
@@ -2296,6 +2300,7 @@ void go_to_sleep(void) {
   sei();                                // ensure interrupts enabled
   sleep_cpu();                          // MCU sleeps here
   sleep_disable();                      // resumes here after wake
+  power_all_enable();                   // Re-enable after wake
   PCMSK &= ~(1 << PCINT1);              // Disable PCINT1
 }
 
@@ -2798,40 +2803,55 @@ void setup() {
   _delay_ms(50);
 }
 
-// This function is called when you press the button. Its job is to activate the sonic screwdriver
+/**
+ * @brief  Activates the "Sonic Screwdriver" Effects.
+ * @desc   1. Reconfigures Pins from High-Z (Input) to Driven (Output).
+ *         2. Initializes all external peripherals (OLED, Sensors).
+ *         3. Starts the Software PWM and Sound timers.
+ */
 void turnEffectsOn() {
-  // Now we perform our "just-in-time" pin configuration.
-  // Only at the moment the button is pressed do we take control of the special pins.
+  // --- PIN CONFIGURATION: TAKING CONTROL ---
+  // We explicitly drive the pins now.
+  // Note: Pin 6 (PB1) is now forcibly taken from the Switch and given to the LED.
   pinMode(PIEZO_PLUS_PIN, OUTPUT);
   pinMode(PIEZO_MINUS_PIN, OUTPUT);
-  pinMode(LED_PIN, OUTPUT); // Make sure SWITCH/LED is set to LED
+  pinMode(LED_PIN, OUTPUT);
   pinMode(SDA_PIN, OUTPUT);
   pinMode(SCL_PIN, OUTPUT);
 
-  // 3. Device Init
-  SSD1306_Init();  // Configure Screen
-  QMC5883P_Init(); // Configure Compass
-  BME280_Init();   // Configure Sensor
-  sonic_Init();
-  led_Init();
+  // --- DEVICE INITIALIZATION ---
+  SSD1306_Init();  // Configure Screen buffers
+  QMC5883P_Init(); // Configure Compass settings
+  BME280_Init();   // Configure Atmospheric Sensor
+  sonic_Init();    // Prepare Timer1 for sound
+  led_Init();      // Prepare Timer0 for LED PWM
 
-  // 4. Initial Screen Draw
+  // --- UI RESET ---
   SSD1306_Clear();
   SSD1306_Wake();
 }
 
-// This function is called when you release the button. Its job is to deactivate the sonic screwdriver
-void turnEffectsOff() {
-  SSD1306_Sleep();
-  sonic_noTone(); // sound off
-  digitalWrite(LED_PIN, HIGH); // led off
 
-  // This is the most critical part for making our project programmable.
-  // We release our control of the special programming pins, making them "safe"
-  // and ready for the next time you want to upload code.
+/**
+ * @brief  Deactivates Effects and prepares for Sleep.
+ * @desc   1. Shuts down peripherals to save power.
+ *         2. Reconfigures Pins to INPUT (High-Z).
+ *         This is critical for ISP Programming safety; it ensures the ATtiny
+ *         doesn't fight the programmer on the shared pins when idle.
+ */
+void turnEffectsOff() {
+  // --- SHUTDOWN PERIPHERALS ---
+  SSD1306_Sleep();
+  BME280_Sleep();
+  sonic_noTone();
+  digitalWrite(LED_PIN, HIGH);// Turn LED OFF
+
+  // --- PIN CONFIGURATION: RELEASING CONTROL ---
+  // We set pins to INPUT to float them.
+  // This allows the Switch to work again (PB1) and makes ISP programming safe.
   pinMode(PIEZO_PLUS_PIN, INPUT);
   pinMode(PIEZO_MINUS_PIN, INPUT);
-  pinMode(LED_PIN, INPUT); // Make sure SWITCH/LED is set to switch
+  pinMode(LED_PIN, INPUT);
   pinMode(SDA_PIN, INPUT);
   pinMode(SCL_PIN, INPUT);
 }
