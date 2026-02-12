@@ -2540,21 +2540,21 @@ void sonic_noTone(void)
 }
 
 // This function creates the Doctor Who WARBLE sound.
-void updateSonicWarble(long timeSinceStart) {
+void updateSonicWarble(long durationSinceStart) {
 
 	// --- Create SONG #1: The Sweep ---+
 	long baseFrequency;
-	if (timeSinceStart >= sweepDuration) {
+	if (durationSinceStart >= sweepDuration) {
 		// If the sweep time is over, just hold the pitch at the end frequency.
 		baseFrequency = endFrequency;
 	} else {
 		// Otherwise, use map() to calculate the current pitch of the upward slide.
-		baseFrequency = map(timeSinceStart, 0, sweepDuration, startFrequency, endFrequency);
+		baseFrequency = map(durationSinceStart, 0, sweepDuration, startFrequency, endFrequency);
 	}
 
 	// --- Create SONG #2: The Warble ---
 	// Use the fast-repeating counter and map() to create the wobble.
-	int warble = map(timeSinceStart % warbleSpeed, 0, warbleSpeed, -warbleDepth, warbleDepth);
+	int warble = map(durationSinceStart % warbleSpeed, 0, warbleSpeed, -warbleDepth, warbleDepth);
 
 	// --- THE FINAL PERFORMANCE ---
 	// Add the two songs together and tell the 'musician' to play the new note.
@@ -2563,82 +2563,186 @@ void updateSonicWarble(long timeSinceStart) {
 
 /*
  * =========================================================================================
- * LED subsystem
+ * LED SUBSYSTEM (SOFTWARE PWM via TIMER0)
  * =========================================================================================
+ *
+ * WHY TIMER0?
+ *   The ATtiny85 only has two timers: Timer0 and Timer1.
+ *   - Timer1 is being used by the Sound Subsystem for high-speed frequency generation.
+ *   - Timer0 is used by the Arduino core for timekeeping (millis(), delay()).
+ *
+ *   Since we cannot steal Timer0 entirely without breaking timekeeping functions,
+ *   we must "piggyback" on it. We enable the "Compare Match B" interrupt, which
+ *   fires in parallel with the standard timekeeping interrupt.
+ *
+ * FREQUENCY CALCULATION:
+ *   - CPU Clock: 8 MHz
+ *   - Timer0 Prescaler: 64 (Standard Arduino setting)
+ *   - Timer0 Bit Depth: 8-bit (Counts 0 to 255)
+ *
+ *   Timer Tick Frequency = 8,000,000 / 64 = 125,000 Hz
+ *   Overflow Frequency   = 125,000 / 256   = 488 Hz
+ *
+ *   To achieve a full 0-255 brightness range via software without jitter, we use a
+ *   "Two-Cycle Latching" strategy. One cycle handles the ON pulse, the next handles
+ *   the OFF pulse.
+ *
+ *   Effective LED Frequency = 488 Hz / 2 = 244 Hz (Flicker-free).
+ *
+ * THE ENGINEERING PROBLEM: "DOUBLE BUFFERING" IN FAST PWM MODE:
+ *
+ * We are piggybacking on Timer0, which is configured for Fast PWM to support millis().
+ * In Fast PWM mode, the Output Compare Register (OCR0B) is DOUBLE BUFFERED.
+ *
+ * This means:
+ * 1. When we write to OCR0B, the hardware does NOT update the comparator immediately.
+ * 2. It saves the value in a temporary buffer.
+ * 3. The actual update happens only when the Timer Overflows (reaches TOP/255).
+ *
+ * WHY STANDARD SOFTWARE PWM FAILS:
+ * A standard approach uses one cycle:
+ *   - Start at 0: Turn LED ON.
+ *   - Interrupt at 'Duty': Turn LED OFF.
+ *   - *Goal*: Set next interrupt for '255' (End of Cycle) to reset.
+ *
+ * *Failure Mode*: Because of Double Buffering, if we try to set the interrupt target
+ * to '255' while inside the 'Duty' interrupt, the hardware waits until the NEXT
+ * overflow to apply it. We effectively lose control of the timer for the remainder
+ * of the cycle, causing severe jitter and limiting brightness to 50%.
+ *
+ * THE SOLUTION: "TWO-CYCLE LATCHING" STRATEGY:
+ *
+ * To bypass the buffering limitation, we spread one logic PWM period over TWO
+ * hardware timer overflows. We alternate between two phases:
+ *
+ *   PHASE 0 (The ON Cycle):
+ *   - We start with LED ON.
+ *   - We set OCR0B = 'Duty'.
+ *   - When interrupt fires: We Turn LED OFF.
+ *     (The timer continues running to 255, but we don't care, LED is off).
+ *
+ *   PHASE 1 (The OFF Cycle):
+ *   - We start with LED OFF.
+ *   - We set OCR0B = '255 - Duty' (The remaining time needed to complete the period).
+ *   - When interrupt fires: We Turn LED ON.
+ *     (The timer continues running to 255, but we don't care, LED is on).
+ *
+ * MULTIPLEXING & BIT-BANGING:
+ *   Hardware PWM (OC0B pin) cannot be used directly because PB1 is physically shared
+ *   with the Switch input and the ISP Programmer (MISO).
+ *   - If we let hardware drive the pin automatically, it might interfere with reading
+ *     the switch.
+ *   - Instead, we "Bit-Bang" (manually toggle) the pin inside the Interrupt Service
+ *     Routine (ISR). This gives us code-level control to disable the LED drive
+ *     logic instantly if we need to read the switch or enter sleep mode.
  */
 
 // --- Globals ---
-// This is the bucket the main loop throws data into.
-volatile uint8_t brightness = 0;
+/**
+ * The requested brightness level from the main loop.
+ * Range: 0 (Off) to 255 (Max Brightness).
+ * Marked 'volatile' because it is shared between the main loop (writer) and ISR (reader).
+ */
+volatile uint8_t led_brightness = 0;
 
-// Track the phase: 0 = Pulse Active (Low), 1 = Pulse Inactive (High)
-volatile uint8_t pwm_phase = 0;
+/**
+ * Tracks the current phase of the software PWM cycle.
+ * 0 = Phase A (The "Active" Phase)
+ * 1 = Phase B (The "Rest" Phase)
+ */
+volatile uint8_t led_pwm_phase = 0;
 
 // --- Logic ---
 
-void led_Init() {
-  // 2. Default State: HIGH (LED OFF for Active Low)
-  PORTB |= (1 << PB1);
+/**
+ * @brief  Initializes the LED subsystem without disturbing Timer0's millis() settings.
+ * @return void
+ */
+void led_Init(void) {
+    // 2. Set default State: HIGH (LED OFF for Active Low)
+    // Since the LED is wired Active Low (VCC -> Resistor -> LED -> Pin),
+    //    setting the pin HIGH turns the LED OFF.
+    PORTB |= (1 << LED_PIN);
 
-  // 3. Enable Timer0 Compare Match B Interrupt
-  // We keep this running forever to ensure seamless transitions.
-  TIMSK |= (1 << OCIE0B);
+   // 3. Enable Timer0 Compare Match B Interrupt.
+    // We keep this running continuously to ensure smooth transitions.
+    // Even if brightness is 0, the ISR keeps running to latch new values seamlessly.
+    TIMSK |= (1 << OCIE0B);
 
-  // 4. Initial Trigger
+    // 4. Initial Trigger point.
+    // Set a safe middle value to start the comparator logic.
   OCR0B = 128;
 }
 
-// --- The Single ISR ---
-
+/**
+ * @brief  Timer0 Compare Match B Interrupt Service Routine.
+ * @desc   Handles the manual pin toggling for Software PWM.
+ *         Runs at approx 488 Hz.
+ *         Implements a "Phase-Correct" strategy to allow full 0-255 range.
+ */
 ISR(TIMER0_COMPB_vect) {
-  // We use a static variable to hold the brightness stable
-  // for the duration of a full ON/OFF cycle.
+  // Static variable preserves value between interrupt calls.
+  // This holds the brightness value constant for the duration of one full ON/OFF cycle.
   static uint8_t latched_duty = 0;
 
-  if (pwm_phase == 0) {
+  if (led_pwm_phase == 0) {
     // =========================================================
-    // END OF "ON" PHASE -> STARTING "OFF" PHASE
+    // PHASE A: END OF "ON" PHASE -> STARTING "OFF" PHASE
     // =========================================================
 
-    // 1. Turn LED OFF (Set HIGH for Active Low)
-    // (Always perform this safety set to ensure clean edges)
-    PORTB |= (1 << PB1);
+    // 1. Turn LED OFF.
+    // Active Low logic: HIGH = OFF.
+    // We always force this state here to ensure clean square waves.
+    // Note: bitwise OR preserves other pins (like Piezo on PB3/PB4).
+    PORTB |= (1 << LED_PIN);
 
     // 2. Calculate time to stay OFF
     // We want to fill the rest of the 255-tick window.
     // Note: We use the duty we latched at the START of the cycle.
     OCR0B = 255 - latched_duty;
 
-    // 3. Switch Phase
-    pwm_phase = 1;
+    // 3. Prepare for next phase.
+    led_pwm_phase = 1;
 
   } else {
     // =========================================================
-    // END OF "OFF" PHASE -> STARTING "ON" PHASE
+    // PHASE B: END OF "OFF" PHASE -> STARTING "ON" PHASE
     // =========================================================
 
-    // 1. LATCH NEW DATA
-    // This is the safe moment to accept a new value from the main loop.
-    latched_duty = brightness;
+    // 1. LATCH NEW DATA.
+    // This is the only safe moment to update, ensuring no visual glitches.
+    // This is the synchronization point. We grab the freshest value
+    // from the main loop now, before starting a new visual pulse.
+    latched_duty = led_brightness;
 
     // 2. Turn LED ON (Set LOW for Active Low)
     // Only if brightness is > 0 (otherwise stay OFF)
     if (latched_duty > 0) {
-      PORTB &= ~(1 << PB1);
+      PORTB &= ~(1 << LED_PIN);
     }
 
     // 3. Calculate time to stay ON
+    // The interrupt will fire again after 'latched_duty' ticks.
     OCR0B = latched_duty;
 
-    // 4. Switch Phase
-    pwm_phase = 0;
+    // 4. Prepare for next phase.
+    led_pwm_phase = 0;
   }
 }
 
-// This function creates the smooth THROB effect for the LED.
-void updateLedThrob(long timeSinceStart) {
-  long angle = (timeSinceStart * 360) / mSecPerCycle;
-  brightness = sin_deg(angle + 270) + 127;  // returns -127..127
+/**
+ * @brief  Calculates a throbbing brightness effect based on time.
+ * @param  durationSinceStart  Milliseconds elapsed since effect started.
+ */
+void updateLedThrob(long durationSinceStart) {
+  // Calculate angle (0-360 degrees) based on cycle duration
+  long angle = (durationSinceStart * 360) / mSecPerCycle;
+
+  // Use sin_deg/cos_deg or pre-calculated table (assumed available in project)
+  // +127 shifts the -127..+127 sine wave to 0..254 range.
+  // The result is passed to our safe setter function.
+  // Add 270 degrees so phase starts at angle(0) -> 0 (OFF)
+  led_brightness = sin_deg(angle + 270) + 127;  // returns -127..127
 }
 
 /*
@@ -2789,19 +2893,42 @@ void loopUI() {
 #endif
 }
 
-// =================================================================================
-// === THE REST OF THE CODE - THE MAIN RECIPE ======================================
-// =================================================================================
+/*
+ * =========================================================================================
+ * MAIN APPLICATION LOGIC & STATE MACHINE
+ * =========================================================================================
+ *
+ * ARCHITECTURAL OVERVIEW:
+ *   The ATtiny85 is a resource-constrained environment with only 6 I/O pins.
+ *   To achieve complex behavior (OLED, Sensors, Sound, LED, Button), we must employ
+ *   Time-Division Multiplexing on Pin 6 (PB1).
+ *
+ * PIN 6 (PB1) DUALITY:
+ *   1. INPUT MODE (Sleep):   The pin acts as a sensor to detect button presses.
+ *   2. OUTPUT MODE (Active): The pin drives the LED using Software PWM.
+ *
+ * TIMER UTILIZATION:
+ *   This project utilizes 100% of the available hardware timers:
+ *   - TIMER 0: Handles System Time (millis) AND LED Software PWM (via Interrupt).
+ *   - TIMER 1: Handles High-Speed Frequency Generation for the Piezo Sounder.
+ *
+ */
 
-// The setup() function is the first part of our recipe.
-// It runs only ONCE, when the chip first gets power. Its job is to get things ready.
-void setup() {
-  I2C_Init(); // Set SDA/SCL to Float/High-Z ONCE
+// --- Global State Variables ---
 
-  // 2. Hardware Stabilization
-  // Give voltage time to stabilize before talking to chips
-  _delay_ms(50);
-}
+/**
+ * Timestamp (ms) when the switch was FIRST pressed.
+ * This determines the absolute phase of the audio warble.
+ * It is NOT modified during the sampling loops to ensure continuous sound.
+ */
+unsigned long soundStartTime;
+
+/**
+ * Timestamp (ms) marking the start of the CURRENT LED pulse.
+ * This is incremented by 'ledPeriodMs' every cycle to align the
+ * sampling window with the "Off" state of the LED.
+ */
+unsigned long lightStartTime;
 
 /**
  * @brief  Activates the "Sonic Screwdriver" Effects.
@@ -2856,72 +2983,108 @@ void turnEffectsOff() {
   pinMode(SCL_PIN, INPUT);
 }
 
-unsigned long soundStartTime; // Remembers the exact moment (in milliseconds) the effects were turned on.
-unsigned long lightStartTime; // Remembers the exact moment (in milliseconds) the effects were turned on.
-byte lastButtonState = HIGH; // Remembers if the button was pressed or not on the very last loop.
+/**
+ * @brief  System Setup
+ * @desc   Runs once at power-on. Initializes communication lines to a safe state
+ *         and allows power voltages to stabilize before talking to peripherals.
+ */
+void setup() {
+  I2C_Init(); // Set SDA/SCL to Float/High-Z ONCE to prevent bus contention
 
-// The loop() function is the main part of our recipe.
-// After setup() is finished, the chip runs this code over and over and over,
-// thousands of times per second, forever!
+  // Hardware Stabilization Delay
+  _delay_ms(50);
+
+  // CPU HALT. Wait for switch press
+  go_to_sleep();
+
+  // wake up device
+  turnEffectsOn();
+
+  // Remember start times
+  lightStartTime = soundStartTime = millis();
+}
+
+/**
+ * @brief  Main Execution Loop
+ * @desc   Handles the Time-Division Multiplexing logic.
+ */
 void loop() {
-  byte currentButtonState;
 
-  // If the LED is busy with a cycle, finish that first before sensing the button
-  if (lastButtonState == HIGH) {
-    // device if OFF and pin6 is configured for switch
-    currentButtonState = digitalRead(SWITCH_PIN);
-  } else {
-    // device if ON and pin6 is configured for LED
-    currentButtonState = LOW;
+  // -------------------------------------------------------------------------
+  // 1. CALCULATE RELATIVE TIMELINES
+  // -------------------------------------------------------------------------
 
-    // if cycle is complete as to sense switch
-    long duration = (long) (millis() - lightStartTime); // cast to long because difference is a signed delta
-    if (duration >= mSecPerCycle) {
-      // LED finished cycle, switch can be sampled
-      pinMode(LED_PIN, INPUT); // change to switch
-      _delay_us(20); // stabilize
-      currentButtonState = digitalRead(SWITCH_PIN);
-      pinMode(LED_PIN, OUTPUT); // change to LED
+  // Light Phase: Resets every cycle (Sawtooth 0 -> ledPeriodMs)
+  long lightElapsed = (long) (millis() - lightStartTime);
 
-      // next cycle
-      lightStartTime += mSecPerCycle;
-    }
-  }
+  // Sound Phase: Continuous since press (Linear 0 -> Infinity)
+  long soundElapsed = (long) (millis() - soundStartTime);
 
-  // --- Step 1: Edge detection ---
-  bool pressed  = (currentButtonState == LOW && lastButtonState != LOW);
-  bool released = (currentButtonState != LOW && lastButtonState == LOW);
+  // -------------------------------------------------------------------------
+  // 2. CHECK LED CYCLE COMPLETION
+  // -------------------------------------------------------------------------
 
-  // --- Step 2: Activate or deactivate effects ---
+  if (lightElapsed < mSecPerCycle) {
+    // LED cycle still bust
 
-  // This is called "edge detection". It checks for the *exact moment* you press the button.
-  // It's only true if the button is LOW now, AND it was HIGH on the last loop.
-  if (pressed) {
-    lightStartTime = soundStartTime = millis(); // We record this exact moment as our start time.
-    turnEffectsOn(); // turn everything on
-  }
+    // Update Light (Software PWM / Timer0)
+    // Driven by the cycling 'lightElapsed' time base.
+    updateLedThrob(lightElapsed);
 
-  // This checks for the *exact moment* you release the button.
-  if (released) {
-    turnEffectsOff(); // turn everything off
-    // here the button has been released
-    go_to_sleep();
-    // will reach here after button has been pressed
-    // Note that currentButtonState=HIGH
-  }
+    // Update Sound (Hardware Wave / Timer1)
+    // Driven by the absolute 'soundElapsed' time base.
+    // This ensures no hiccups in the audio even when the LED resets.
+    updateSonicWarble(soundElapsed);
 
-  // --- Step 3: Run the effects (if they are supposed to be on) ---
-  if (currentButtonState == LOW) {
-    // This is the core of our project! If the effects are active, we run the
-    // functions that update the light and sound. Because this loop runs thousands
-    // of times per second, we are giving the light and sound a tiny update
-    // on each pass, creating the illusion of a smooth, continuous effect.
-    updateLedThrob((long) (millis() - lightStartTime));    // ...run the smooth throb function.
-    updateSonicWarble((long) (millis() - soundStartTime)); // The sound function runs in either mode.
-
+    // Update UI (OLED)
     loopUI();
+
+    return;
   }
 
-  lastButtonState = currentButtonState; // update history
+  // -------------------------------------------------------------------------
+  // 3. SENSE SWITCH
+  // -------------------------------------------------------------------------
 
-} // End of the loop() function. It now starts over from the very top!
+  // The LED is logically OFF (End of Cycle), so it is safe to switch.
+
+  // SWITCH MULTIPLEXER (Output/LED -> Input/Switch)
+  pinMode(LED_PIN, INPUT);
+  _delay_us(20); // Allow voltage to stabilize
+
+  // READ HARDWARE
+  // LOW = Pressed, HIGH = Released.
+  byte buttonState = digitalRead(SWITCH_PIN);
+
+  // SWITCH MULTIPLEXER (Input/Switch -> Output/LED)
+  pinMode(LED_PIN, OUTPUT);
+
+  if (buttonState == LOW) {
+    // -------------------------------------------------------------------------
+    // 4. SWITCH HOLD DOWN
+    // -------------------------------------------------------------------------
+
+    // We increment the start time by exactly one period length.
+    // This ensures the next sine wave starts perfectly in phase,
+    // creating seamless visual smoothness despite the interruption.
+    lightStartTime += mSecPerCycle;
+
+    return;
+  }
+
+  // -------------------------------------------------------------------------
+  // 5. SWITCH RELEASED
+  // -------------------------------------------------------------------------
+
+  // shutdown device
+  turnEffectsOff();
+
+  // CPU HALT. Wait for switch press
+  go_to_sleep();
+
+  // wake up device
+  turnEffectsOn();
+
+  // Remember start times
+  lightStartTime = soundStartTime = millis();
+}
