@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 ## [Unreleased]
 
 ```
+2026-02-14 23:22:49 Added mod selector. long hold = trobbing, short hold = flashlight.
 2026-02-14 20:26:10 Put compass in continuous mode and probe DRDY to mitigate spurious read errors.
 2026-02-14 17:52:02 Interleave UI updates to decrease duration.
 ```
