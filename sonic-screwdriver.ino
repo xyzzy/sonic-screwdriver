@@ -645,7 +645,7 @@ I2C_Status_t I2C_Write(uint8_t dev_addr, const uint8_t *p_data, uint8_t length)
  * @brief  Measures the Power Supply Voltage (VCC).
  * @return uint16_t Voltage in millivolts (e.g., 3005 = 3.005V).
  */
-uint16_t Battery_GetVoltage(void) {
+uint16_t battery_GetVoltage(void) {
     uint16_t adc_val;
     uint32_t vcc_calc;
 
@@ -714,7 +714,7 @@ uint16_t Battery_GetVoltage(void) {
  * @param  mv Voltage in millivolts.
  * @return uint8_t Percentage (0-100).
  */
-uint8_t Battery_GetPercentage(uint16_t mv) {
+uint8_t battery_GetPercentage(uint16_t mv) {
     /* CR2032 Curve (Approximate linear region under load)
      * > 3.00V : 100% (Fresh)
      * < 2.40V : 0%   (Dead/Brownout risk)
@@ -962,10 +962,14 @@ void SSD1306_Clear(void) {
  * Storing only 91 bytes saves 270 bytes of Flash memory.
  */
 static const int8_t sin_LUT[] PROGMEM = {
-	0, 2, 4, 7, 9, 11, 13, 15, 18, 20, 22, 24, 26, 29, 31, 33, 35, 37, 39, 41,
-	43, 46, 48, 50, 52, 54, 56, 58, 60, 62, 64, 65, 67, 69, 71, 73, 75, 76, 78, 80,
-	82, 83, 85, 87, 88, 90, 91, 93, 94, 96, 97, 99, 100, 101, 103, 104, 105, 107, 108, 109,
-	110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 119, 120, 121, 121, 122, 123, 123, 124, 124, 125,
+	0, 2, 4, 7, 9, 11, 13, 15, 18, 20,
+	22, 24, 26, 29, 31, 33, 35, 37, 39, 41,
+	43, 46, 48, 50, 52, 54, 56, 58, 60, 62,
+	64, 65, 67, 69, 71, 73, 75, 76, 78, 80,
+	82, 83, 85, 87, 88, 90, 91, 93, 94, 96,
+	 97,  99, 100, 101, 103, 104, 105, 107, 108, 109,
+	110, 111, 112, 113, 114, 115, 116, 117, 118, 119,
+	119, 120, 121, 121, 122, 123, 123, 124, 124, 125,
 	125, 125, 126, 126, 126, 127, 127, 127, 127, 127,
 };
 
@@ -1002,25 +1006,25 @@ static int8_t sin_deg(int16_t angle) {
      */
 
     /* Quadrant 1: 0 to 90 degrees */
-    if (angle <= 90) {
+    if (angle < 90) {
         /* Direct Lookup */
         return (int8_t) pgm_read_byte(&sin_LUT[angle]);
     }
 
     /* Quadrant 2: 91 to 180 degrees */
-    if (angle <= 180) {
+    if (angle < 180) {
         /* Mirror Horizontal: sin(170) == sin(10) */
-        return (int8_t) pgm_read_byte(&sin_LUT[180 - angle]);
+        return (int8_t) pgm_read_byte(&sin_LUT[179 - angle]);
     }
 
     /* Quadrant 3: 181 to 270 degrees */
-    if (angle <= 270) {
+    if (angle < 270) {
         /* Mirror Vertical: sin(190) == -sin(10) */
         /* Note: We read the positive value, then negate the result. */
         return -(int8_t) pgm_read_byte(&sin_LUT[angle - 180]);
     }
 
-    return -(int8_t) pgm_read_byte(&sin_LUT[360 - angle]);
+    return -(int8_t) pgm_read_byte(&sin_LUT[359 - angle]);
 }
 
 /**
@@ -2352,12 +2356,12 @@ const byte SCL_PIN = PB2;         // chip pin 7
 // --- EFFECT "SEASONING" ---
 // These are the fun numbers you can change to be a "sound designer"!
 // Try changing them and see what happens to the final effect.
-int   mSecPerCycle    = 500; // How fast the LED cycles
-int   startFrequency  = 800;  // The starting pitch of the sound (in Hertz).
-int   endFrequency    = 1800; // The ending pitch of the sound.
-int   sweepDuration   = 700;  // How many milliseconds the sound takes to slide up.
-int   warbleDepth     = 30;   // How "wobbly" the sound is. Try 10 for subtle, 100 for crazy!
-int   warbleSpeed     = 25;   // How fast the wobble is. Lower numbers are faster!
+const int   mSecPerHalfCycle  = 2000 / 2; // How fast the LED cycles
+const int   startFrequency    = 800;      // The starting pitch of the sound (in Hertz).
+const int   endFrequency      = 1800;     // The ending pitch of the sound.
+const int   sweepDuration     = 700;      // How many milliseconds the sound takes to slide up.
+const int   warbleDepth       = 30;       // How "wobbly" the sound is. Try 10 for subtle, 100 for crazy!
+const int   warbleSpeed       = 25;       // How fast the wobble is. Lower numbers are faster!
 
 /*
  * =========================================================================================
@@ -2643,7 +2647,7 @@ void updateSonicWarble(long durationSinceStart) {
  * Range: 0 (Off) to 255 (Max Brightness).
  * Marked 'volatile' because it is shared between the main loop (writer) and ISR (reader).
  */
-volatile uint8_t led_brightness = 0;
+volatile uint8_t led_brightness = 255; // OFF
 
 /**
  * Tracks the current phase of the software PWM cycle.
@@ -2684,6 +2688,17 @@ ISR(TIMER0_COMPB_vect) {
   // Static variable preserves value between interrupt calls.
   // This holds the brightness value constant for the duration of one full ON/OFF cycle.
   static uint8_t latched_duty = 0;
+
+  // handle edge cases
+  if (led_brightness < 2) {
+    // forced off
+    PORTB |= (1 << LED_PIN);
+    return;
+  } else if (led_brightness > 253) {
+    // forced on
+    PORTB &= ~(1 << LED_PIN);
+    return;
+  }
 
   if (led_pwm_phase == 0) {
     // =========================================================
@@ -2736,13 +2751,13 @@ ISR(TIMER0_COMPB_vect) {
  */
 void updateLedThrob(long durationSinceStart) {
   // Calculate angle (0-360 degrees) based on cycle duration
-  long angle = (durationSinceStart * 360) / mSecPerCycle;
+  long angle = (durationSinceStart * 180) / mSecPerHalfCycle;
 
   // Use sin_deg/cos_deg or pre-calculated table (assumed available in project)
   // +127 shifts the -127..+127 sine wave to 0..254 range.
   // The result is passed to our safe setter function.
   // Add 270 degrees so phase starts at angle(0) -> 0 (OFF)
-  led_brightness = sin_deg(angle + 270) + 127;  // returns -127..127
+  led_brightness = sin_deg(angle + 90) + 127;  // returns -127..127
 }
 
 /*
@@ -2858,6 +2873,7 @@ void loopUI() {
     OLED_draw_compass(0, 0, -heading_deg);
   }
 
+#if 1
   int16_t temp = BME280_ReadTemp();
   OLED_set_cursor(4, 0);
   OLED_string("Temp:");
@@ -2866,7 +2882,6 @@ void loopUI() {
   OLED_print_int(temp % 100, 2);
   OLED_string(" \x7f" "C"); // split ° and C
 
-#if 1
   uint32_t p_pa = BME280_ReadPressure(); // e.g. 101325 (Pa)
   OLED_set_cursor(5, 0);
   OLED_string("Baro:");
@@ -2883,7 +2898,7 @@ void loopUI() {
   OLED_print_int(hum % 100, 2);
   OLED_string(" %");
 
-  int16_t bat = Battery_GetVoltage();
+  int16_t bat = battery_GetVoltage();
   OLED_set_cursor(7, 0);
   OLED_string("Bat :");
   OLED_print_int(bat / 1000, 3);
@@ -2928,7 +2943,7 @@ unsigned long soundStartTime;
  * This is incremented by 'ledPeriodMs' every cycle to align the
  * sampling window with the "Off" state of the LED.
  */
-unsigned long lightStartTime;
+unsigned long throbStartTime;
 
 /**
  * @brief  Activates the "Sonic Screwdriver" Effects.
@@ -2984,6 +2999,14 @@ void turnEffectsOff() {
 }
 
 /**
+ * @date 2026-02-14 08:46:56
+ *
+ * It tuens out that the LED brightness when pressing/releasing mismatches the throbbing cycle,
+ *   so more half-cycle states are introduced
+ */
+enum { ACTIVATE, RUNNING, WAIT, DEACTIVATE } state = ACTIVATE;
+
+/**
  * @brief  System Setup
  * @desc   Runs once at power-on. Initializes communication lines to a safe state
  *         and allows power voltages to stabilize before talking to peripherals.
@@ -2994,14 +3017,8 @@ void setup() {
   // Hardware Stabilization Delay
   _delay_ms(50);
 
-  // CPU HALT. Wait for switch press
-  go_to_sleep();
-
-  // wake up device
-  turnEffectsOn();
-
-  // Remember start times
-  lightStartTime = soundStartTime = millis();
+  // Wait for initial switch press
+  state = DEACTIVATE;
 }
 
 /**
@@ -3010,81 +3027,103 @@ void setup() {
  */
 void loop() {
 
-  // -------------------------------------------------------------------------
-  // 1. CALCULATE RELATIVE TIMELINES
-  // -------------------------------------------------------------------------
+  /*
+   * Test for device (de-)activation
+   */
+
+  if (state == DEACTIVATE) {
+    // shutdown device
+    turnEffectsOff();
+
+    // CPU HALT. Wait for switch press
+    go_to_sleep();
+
+    // after wakeup, activate device
+    state = ACTIVATE;
+  }
+
+  if (state == ACTIVATE) {
+    // activate the device
+
+    // switch led OFF
+    led_brightness = 255;
+
+    // wakeup device
+    turnEffectsOn();
+
+    // Remember start times
+    throbStartTime = soundStartTime = millis();
+
+    state = RUNNING;
+  }
+
+  /*
+   * calculate relative timelines
+   */
 
   // Light Phase: Resets every cycle (Sawtooth 0 -> ledPeriodMs)
-  long lightElapsed = (long) (millis() - lightStartTime);
+  long throbElapsed = (long) (millis() - throbStartTime);
 
   // Sound Phase: Continuous since press (Linear 0 -> Infinity)
   long soundElapsed = (long) (millis() - soundStartTime);
 
-  // -------------------------------------------------------------------------
-  // 2. CHECK LED CYCLE COMPLETION
-  // -------------------------------------------------------------------------
+  /*
+   * Test if switch needs sensing
+   */
 
-  if (lightElapsed < mSecPerCycle) {
-    // LED cycle still bust
+  if (state == RUNNING && throbElapsed >= mSecPerHalfCycle * 2) {
+    // LED=on, sense switch, only if switch is released will it briefly turn off
 
-    // Update Light (Software PWM / Timer0)
-    // Driven by the cycling 'lightElapsed' time base.
-    updateLedThrob(lightElapsed);
+    // switch multiplexer to Input/Switch
+    pinMode(LED_PIN, INPUT_PULLUP);
+    _delay_us(40); // Allow voltage to stabilize
 
-    // Update Sound (Hardware Wave / Timer1)
-    // Driven by the absolute 'soundElapsed' time base.
-    // This ensures no hiccups in the audio even when the LED resets.
-    updateSonicWarble(soundElapsed);
+    // red pin6 state
+    // LOW = Pressed, HIGH = Released.
+    byte buttonState = digitalRead(SWITCH_PIN);
 
-    // Update UI (OLED)
-    loopUI();
+    // switch multiplexer to Output/LED
+    pinMode(LED_PIN, OUTPUT);
 
-    return;
+    if (buttonState != LOW) {
+      // switch released, wait until LED goes off and deactivate
+      state = WAIT;
+    } else {
+      // We increment the start time by exactly one period length.
+      // This ensures the next sine wave starts perfectly in phase,
+      // creating seamless visual smoothness despite the interruption.
+      throbStartTime += mSecPerHalfCycle * 2;
+    }
   }
 
-  // -------------------------------------------------------------------------
-  // 3. SENSE SWITCH
-  // -------------------------------------------------------------------------
+  /*
+   * Test for timed deactivation after switch release
+   */
+  /**
+   * @date 2026-02-14 16:56:41
+   * loopUI() can take up to 125 mSec to complete, which might be so long
+   * that the next test might occur on the rising edge causing it to miss.
+   * To counter this, test for led OFF, and a maximum wait time
+   */
 
-  // The LED is logically OFF (End of Cycle), so it is safe to switch.
-
-  // SWITCH MULTIPLEXER (Output/LED -> Input/Switch)
-  pinMode(LED_PIN, INPUT);
-  _delay_us(20); // Allow voltage to stabilize
-
-  // READ HARDWARE
-  // LOW = Pressed, HIGH = Released.
-  byte buttonState = digitalRead(SWITCH_PIN);
-
-  // SWITCH MULTIPLEXER (Input/Switch -> Output/LED)
-  pinMode(LED_PIN, OUTPUT);
-
-  if (buttonState == LOW) {
-    // -------------------------------------------------------------------------
-    // 4. SWITCH HOLD DOWN
-    // -------------------------------------------------------------------------
-
-    // We increment the start time by exactly one period length.
-    // This ensures the next sine wave starts perfectly in phase,
-    // creating seamless visual smoothness despite the interruption.
-    lightStartTime += mSecPerCycle;
-
-    return;
+  if (state == WAIT && (led_brightness == 0 || throbElapsed >= mSecPerHalfCycle * 3)) {
+    // LED is now off, deactivate
+    state = DEACTIVATE;
   }
 
-  // -------------------------------------------------------------------------
-  // 5. SWITCH RELEASED
-  // -------------------------------------------------------------------------
+  /*
+   * Update device
+   */
 
-  // shutdown device
-  turnEffectsOff();
+  // Update Light (Software PWM / Timer0)
+  // Driven by the cycling 'lightElapsed' time base.
+  updateLedThrob(throbElapsed);
 
-  // CPU HALT. Wait for switch press
-  go_to_sleep();
+  // Update Sound (Hardware Wave / Timer1)
+  // Driven by the absolute 'soundElapsed' time base.
+  // This ensures no hiccups in the audio even when the LED resets.
+  updateSonicWarble(soundElapsed);
 
-  // wake up device
-  turnEffectsOn();
-
-  // Remember start times
-  lightStartTime = soundStartTime = millis();
+  // Update UI (OLED)
+  loopUI();
 }
