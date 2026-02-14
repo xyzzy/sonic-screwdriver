@@ -2842,70 +2842,104 @@ Notes / Safety:
 // === Screen handler
 // =================================================================================
 
+/**
+ * @date 2026-02-14 17:39:24
+ * This function van take upto 130 mSec which is noticably effecting sound and light effects.
+ * Interleave to give sound updates more chance.
+ *
+ */
 void loopUI() {
-  struct QMC5883P_data qmc_data;
-  if (QMC5883P_read(&qmc_data)) {
-    int16_t heading_deg = atan2_deg(qmc_data.y, qmc_data.x);
+  static int interleave = 0;
+  static struct QMC5883P_data qmc_data;
+  static int16_t heading_deg;
 
-    // OLED_set_cursor(0, 40);
-    // OLED_print_uint(heading_deg);
-
-    OLED_set_cursor(0, 14);
-    OLED_string("X");
-    OLED_print_int(qmc_data.x, 4);
-    OLED_string("mG");
-
-    OLED_set_cursor(1, 14);
-    OLED_string("Y");
-    OLED_print_int(qmc_data.y, 4);
-    OLED_string("mG");
-
-    OLED_set_cursor(2, 14);
-    OLED_string("Z");
-    OLED_print_int(qmc_data.z, 4);
-    OLED_string("mG");
-
-    char strbuf[10];
-    OLED_sprint_uint(strbuf, heading_deg, 3);
-    OLED_print_big(1, 6, strbuf);
-    OLED_print_big(1, 6 + 3 * 2, "\x7f"); //  above is 3 double cell wide
-
-    OLED_draw_compass(0, 0, -heading_deg);
+  switch (interleave) {
+    case 0:
+      if (!QMC5883P_read(&qmc_data)) {
+	interleave = 5;
+	return;
+      }
+      OLED_set_cursor(0, 14);
+      OLED_string("X");
+      OLED_print_int(qmc_data.x, 4);
+      OLED_string("mG");
+      interleave++;
+      return;
+    case 1:
+      OLED_set_cursor(1, 14);
+      OLED_string("Y");
+      OLED_print_int(qmc_data.y, 4);
+      OLED_string("mG");
+      interleave++;
+      return;
+    case 2:
+      OLED_set_cursor(2, 14);
+      OLED_string("Z");
+      OLED_print_int(qmc_data.z, 4);
+      OLED_string("mG");
+      interleave++;
+      return;
+    case 3: {
+      heading_deg = atan2_deg(qmc_data.y, qmc_data.x);
+      char strbuf[10];
+      OLED_sprint_uint(strbuf, heading_deg, 3);
+      OLED_print_big(1, 6, strbuf);
+      OLED_print_big(1, 6 + 3 * 2, "\x7f"); //  above is 3 double cell wide
+      interleave++;
+      return;
+    }
+    case 4:
+      OLED_draw_compass(0, 0, -heading_deg);
+      interleave++;
+      return;
+    case 5: {
+      int16_t temp = BME280_ReadTemp();
+      OLED_set_cursor(4, 0);
+      OLED_string("Temp:");
+      OLED_print_int(temp / 100, 4);
+      OLED_string(".");
+      OLED_print_int(temp % 100, 2);
+      OLED_string(" \x7f" "C"); // split ° and C
+      interleave++;
+      return;
+    }
+    case 6: {
+      uint32_t p_pa = BME280_ReadPressure(); // e.g. 101325 (Pa)
+      OLED_set_cursor(5, 0);
+      OLED_string("Baro:");
+      OLED_print_int(p_pa / 100, 4);
+      OLED_string(".");
+      OLED_print_int(p_pa % 100, 2);
+      OLED_string(" hPa");
+      interleave++;
+      return;
+    }
+    case 7: {
+      int16_t hum = BME280_ReadHumidity();
+      OLED_set_cursor(6, 0);
+      OLED_string("Hum :");
+      OLED_print_int(hum / 100, 4);
+      OLED_string(".");
+      OLED_print_int(hum % 100, 2);
+      OLED_string(" %");
+      interleave++;
+      return;
+    }
+    case 8: {
+      int16_t bat = battery_GetVoltage();
+      OLED_set_cursor(7, 0);
+      OLED_string("Bat :");
+      OLED_print_int(bat / 1000, 3);
+      OLED_string(".");
+      OLED_print_int(bat % 1000, 3);
+      OLED_string(" V");
+      interleave = 0;
+      return;
+    }
+    default:
+      interleave = 0;
+      return;
   }
-
-#if 1
-  int16_t temp = BME280_ReadTemp();
-  OLED_set_cursor(4, 0);
-  OLED_string("Temp:");
-  OLED_print_int(temp / 100, 4);
-  OLED_string(".");
-  OLED_print_int(temp % 100, 2);
-  OLED_string(" \x7f" "C"); // split ° and C
-
-  uint32_t p_pa = BME280_ReadPressure(); // e.g. 101325 (Pa)
-  OLED_set_cursor(5, 0);
-  OLED_string("Baro:");
-  OLED_print_int(p_pa / 100, 4);
-  OLED_string(".");
-  OLED_print_int(p_pa % 100, 2);
-  OLED_string(" hPa");
-
-  int16_t hum = BME280_ReadHumidity();
-  OLED_set_cursor(6, 0);
-  OLED_string("Hum :");
-  OLED_print_int(hum / 100, 4);
-  OLED_string(".");
-  OLED_print_int(hum % 100, 2);
-  OLED_string(" %");
-
-  int16_t bat = battery_GetVoltage();
-  OLED_set_cursor(7, 0);
-  OLED_string("Bat :");
-  OLED_print_int(bat / 1000, 3);
-  OLED_string(".");
-  OLED_print_int(bat % 1000, 3);
-  OLED_string(" V");
-#endif
 }
 
 /*
