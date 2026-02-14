@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 ## [Unreleased]
 
 ```
+2026-02-14 17:52:02 Interleave UI updates to decrease duration.
 ```
 
 ## 2020-09-15 13:34:00 Version 1.0.0
