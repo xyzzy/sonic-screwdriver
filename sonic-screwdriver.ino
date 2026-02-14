@@ -1099,9 +1099,10 @@ uint16_t atan2_deg(int16_t y, int16_t x) {
             else          return 90 - angle;     // 45-90
         } else {
             // Quadrant 4 (x+, y-)
-            if (ax >= ay) return 360 - angle;    // 315-360
-            else          return 270 + angle;    // 270-315
-        }
+	  if (ax < ay) return 270 + angle;    // 315-360
+	  else if (angle == 0) return 0;
+	  else return 360 - angle;            // 270-315
+	}
     } else {
         if (y >= 0) {
             // Quadrant 2 (x-, y+)
@@ -2312,19 +2313,26 @@ ISR(PCINT0_vect) {
 }
 
 void go_to_sleep(void) {
-  ADCSRA &= ~(1 << ADEN);               // Disable ADC
-  ACSR |= (1 << ACD);                   // Disable analog comparator
-  power_all_disable();                  // Disable all peripherals
-  PCMSK |= (1 << PCINT1);               // Enable PCINT1
-  GIMSK |= (1 << PCIE);                 // Enable pin change interrupts globally
-  set_sleep_mode(SLEEP_MODE_PWR_DOWN);  // lowest power mode
-  sleep_enable();                       // allow sleep
-  sleep_bod_disable();			// disable brown-out detection
-  sei();                                // ensure interrupts enabled
-  sleep_cpu();                          // MCU sleeps here
-  sleep_disable();                      // resumes here after wake
-  power_all_enable();                   // Re-enable after wake
-  PCMSK &= ~(1 << PCINT1);              // Disable PCINT1
+  byte buttonState;
+
+  do {
+    ADCSRA &= ~(1 << ADEN);               // Disable ADC
+    ACSR |= (1 << ACD);                   // Disable analog comparator
+    power_all_disable();                  // Disable all peripherals
+    PCMSK |= (1 << PCINT1);               // Enable PCINT1
+    GIMSK |= (1 << PCIE);                 // Enable pin change interrupts globally
+    set_sleep_mode(SLEEP_MODE_PWR_DOWN);  // lowest power mode
+    sleep_enable();                       // allow sleep
+    sleep_bod_disable();                  // disable brown-out detection
+    sei();                                // ensure interrupts enabled
+    sleep_cpu();                          // MCU sleeps here
+    sleep_disable();                      // resumes here after wake
+    power_all_enable();                   // Re-enable after wake
+    PCMSK &= ~(1 << PCINT1);              // Disable PCINT1
+
+    // probe pin6
+    buttonState = digitalRead(PB1); // wait until  HIGH to LOW
+  } while (buttonState != LOW);
 }
 
 // =================================================================================
@@ -2375,12 +2383,14 @@ const byte SCL_PIN = PB2;         // chip pin 7
 // --- EFFECT "SEASONING" ---
 // These are the fun numbers you can change to be a "sound designer"!
 // Try changing them and see what happens to the final effect.
-const int   mSecPerHalfCycle  = 2000 / 2; // How fast the LED cycles
-const int   startFrequency    = 800;      // The starting pitch of the sound (in Hertz).
-const int   endFrequency      = 1800;     // The ending pitch of the sound.
-const int   sweepDuration     = 700;      // How many milliseconds the sound takes to slide up.
-const int   warbleDepth       = 30;       // How "wobbly" the sound is. Try 10 for subtle, 100 for crazy!
-const int   warbleSpeed       = 25;       // How fast the wobble is. Lower numbers are faster!
+const int modeTimeout          = 300;      // Short press within this time activate flashlight
+const int flashCycle           = 10;       // flash cycle time to sense deactivate
+const int throbHalfCycle       = 2000 / 2; // How fast the LED cycles
+const int startFrequency       = 800;      // The starting pitch of the sound (in Hertz).
+const int endFrequency         = 1800;     // The ending pitch of the sound.
+const int sweepDuration        = 700;      // How many milliseconds the sound takes to slide up.
+const int warbleDepth          = 30;       // How "wobbly" the sound is. Try 10 for subtle, 100 for crazy!
+const int warbleSpeed          = 25;       // How fast the wobble is. Lower numbers are faster!
 
 /*
  * =========================================================================================
@@ -2537,7 +2547,7 @@ void sonic_tone(uint16_t freq)
     sei();
 }
 
-void sonic_noTone(void)
+void sonic_noInt(void)
 {
     cli();
 
@@ -2682,19 +2692,38 @@ volatile uint8_t led_pwm_phase = 0;
  * @return void
  */
 void led_Init(void) {
-    // 2. Set default State: HIGH (LED OFF for Active Low)
-    // Since the LED is wired Active Low (VCC -> Resistor -> LED -> Pin),
-    //    setting the pin HIGH turns the LED OFF.
-    PORTB |= (1 << LED_PIN);
+  // 2. Set default State: HIGH (LED OFF for Active Low)
+  // Since the LED is wired Active Low (VCC -> Resistor -> LED -> Pin),
+  //    setting the pin HIGH turns the LED OFF.
+  PORTB |= (1 << LED_PIN);
 
-   // 3. Enable Timer0 Compare Match B Interrupt.
-    // We keep this running continuously to ensure smooth transitions.
-    // Even if brightness is 0, the ISR keeps running to latch new values seamlessly.
-    TIMSK |= (1 << OCIE0B);
+  // 3. Enable Timer0 Compare Match B Interrupt.
+  // We keep this running continuously to ensure smooth transitions.
+  // Even if brightness is 0, the ISR keeps running to latch new values seamlessly.
+  TIMSK |= (1 << OCIE0B);
 
-    // 4. Initial Trigger point.
-    // Set a safe middle value to start the comparator logic.
+  // 4. Initial Trigger point.
+  // Set a safe middle value to start the comparator logic.
   OCR0B = 128;
+}
+
+/**
+ * Disable led interrupts
+ */
+void led_noInt()
+{
+    cli();  // Disable global interrupts
+
+    /* --- Disable COMPB interrupt --- */
+    TIMSK &= ~(1 << OCIE0B);
+
+    /* --- Clear pending COMPB flags --- */
+    TIFR |= (1 << OCF0B);
+
+    /* --- Optional: reset OCR0B counter (clean) --- */
+    OCR0B = 0;
+
+    sei();  // Re-enable global interrupts
 }
 
 /**
@@ -2770,7 +2799,7 @@ ISR(TIMER0_COMPB_vect) {
  */
 void updateLedThrob(long durationSinceStart) {
   // Calculate angle (0-360 degrees) based on cycle duration
-  long angle = (durationSinceStart * 180) / mSecPerHalfCycle;
+  long angle = (durationSinceStart * 180) / throbHalfCycle;
 
   // Use sin_deg/cos_deg or pre-calculated table (assumed available in project)
   // +127 shifts the -127..+127 sine wave to 0..254 range.
@@ -3018,8 +3047,6 @@ void turnEffectsOn() {
   SSD1306_Init();  // Configure Screen buffers
   QMC5883P_Init(); // Configure Compass settings
   BME280_Init();   // Configure Atmospheric Sensor
-  sonic_Init();    // Prepare Timer1 for sound
-  led_Init();      // Prepare Timer0 for LED PWM
 
   // --- UI RESET ---
   SSD1306_Clear();
@@ -3039,8 +3066,6 @@ void turnEffectsOff() {
   SSD1306_Sleep();
   QMC5883P_sleep();
   BME280_Sleep();
-  sonic_noTone();
-  digitalWrite(LED_PIN, HIGH);// Turn LED OFF
 
   // --- PIN CONFIGURATION: RELEASING CONTROL ---
   // We set pins to INPUT to float them.
@@ -3058,7 +3083,12 @@ void turnEffectsOff() {
  * It tuens out that the LED brightness when pressing/releasing mismatches the throbbing cycle,
  *   so more half-cycle states are introduced
  */
-enum { ACTIVATE, RUNNING, WAIT, DEACTIVATE } state = ACTIVATE;
+enum { ACTIVATE,   // Activate the device
+       FLASHLIGHT, // LED on, sound off
+       THROBBING,  // Throbbing mode
+       WAIT,       // Wait for led to turn off before deactivating
+       DEACTIVATE  // deactivate device
+} state = ACTIVATE;
 
 /**
  * @brief  System Setup
@@ -3082,50 +3112,103 @@ void setup() {
 void loop() {
 
   /*
-   * Test for device (de-)activation
+   * Test for device de-activation
    */
 
   if (state == DEACTIVATE) {
     // shutdown device
+    sonic_noInt();
+    led_noInt();
     turnEffectsOff();
 
     // CPU HALT. Wait for switch press
     go_to_sleep();
 
+    // Remember start times
+    throbStartTime = soundStartTime = millis();
+
     // after wakeup, activate device
     state = ACTIVATE;
   }
 
+  /*
+   * Device is now active.
+   * Calculate relative timelines
+   */
+
+  // LED Phase: Resets every cycle
+  long throbElapsed = (long) (millis() - throbStartTime);
+
+  // Sound Phase: Continuous since press
+  long soundElapsed = (long) (millis() - soundStartTime);
+
+  /*
+   * Test for activation mode select
+   */
+
   if (state == ACTIVATE) {
     // activate the device
 
-    // switch led OFF
-    led_brightness = 255;
+    // wait until selection timer expired
+    if (soundElapsed < modeTimeout)
+      return;
+
+    // LED/switch is still set to switch
+    byte buttonState = digitalRead(SWITCH_PIN);
 
     // wakeup device
     turnEffectsOn();
 
-    // Remember start times
-    throbStartTime = soundStartTime = millis();
+    if (buttonState == LOW) {
+      // switch pressed, throb mode
+      sonic_Init();    // Prepare Timer1 for sound
+      led_Init();      // Prepare Timer0 for LED PWM
 
-    state = RUNNING;
+      // Remember start times
+      throbStartTime = soundStartTime = millis();
+
+      state = THROBBING;
+
+    } else {
+      // switch released, flashlight mode
+      digitalWrite(LED_PIN, LOW);// Turn LED ON
+
+      state = FLASHLIGHT;
+    }
   }
 
   /*
-   * calculate relative timelines
+   * Test for flashlight mode
    */
+  if (state == FLASHLIGHT) {
 
-  // Light Phase: Resets every cycle (Sawtooth 0 -> ledPeriodMs)
-  long throbElapsed = (long) (millis() - throbStartTime);
+    if (throbElapsed < flashCycle) {
+      // Update UI (OLED)
+      loopUI();
+    } else {
+      // sense switch to exit flsahlight
+      // NOTE: no delay
+      pinMode(LED_PIN, INPUT_PULLUP);
+      byte buttonState = digitalRead(SWITCH_PIN);
+      pinMode(LED_PIN, OUTPUT);
+      digitalWrite(LED_PIN, LOW);// Turn LED ON
 
-  // Sound Phase: Continuous since press (Linear 0 -> Infinity)
-  long soundElapsed = (long) (millis() - soundStartTime);
+      if (buttonState == LOW) {
+	// switch pressed
+	state = DEACTIVATE;
+      } else {
+	// wait another cycle
+	throbStartTime += flashCycle;
+      }
+    }
+
+    return;
+  }
 
   /*
-   * Test if switch needs sensing
+   * Test for throbbing continuation
    */
-
-  if (state == RUNNING && throbElapsed >= mSecPerHalfCycle * 2) {
+  if (state == THROBBING && throbElapsed >= throbHalfCycle * 2) {
     // LED=on, sense switch, only if switch is released will it briefly turn off
 
     // switch multiplexer to Input/Switch
@@ -3146,7 +3229,7 @@ void loop() {
       // We increment the start time by exactly one period length.
       // This ensures the next sine wave starts perfectly in phase,
       // creating seamless visual smoothness despite the interruption.
-      throbStartTime += mSecPerHalfCycle * 2;
+      throbStartTime += throbHalfCycle * 2;
     }
   }
 
@@ -3160,7 +3243,7 @@ void loop() {
    * To counter this, test for led OFF, and a maximum wait time
    */
 
-  if (state == WAIT && (led_brightness == 0 || throbElapsed >= mSecPerHalfCycle * 3)) {
+  if (state == WAIT && (led_brightness == 0 || throbElapsed >= throbHalfCycle * 3)) {
     // LED is now off, deactivate
     state = DEACTIVATE;
   }
