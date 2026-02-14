@@ -1891,11 +1891,14 @@ enum {
 };
 
 enum {
-    QMC5883P_CONFIG_CONTROL1    = QMC5883P_OSR_8 | QMC5883P_OSR2_8 | QMC5883P_ODR_50HZ,
-    QMC5883P_CONFIG_CONTROL2    = QMC5883P_RANGE_8G,
-    QMC5883P_CONFIG_SENSITIVITY = QMC5883P_SENSITIVITY_8G,
-};
+    QMC5883P_CONFIG_CONTROL1 = QMC5883P_OSR_8 |   // Lower current moderate noise filtering
+			       QMC5883P_OSR2_8 |  // Light secondary downsampling
+			       QMC5883P_ODR_50HZ, // 50 Hz is visually smooth enough
 
+    QMC5883P_CONFIG_CONTROL2 = QMC5883P_RANGE_8G, // ±8 Gauss range (balanced)
+
+    QMC5883P_CONFIG_SENSITIVITY = QMC5883P_SENSITIVITY_8G // 3750 LSB/G
+};
 
 /* =========================================================================
  *                            DATA STRUCTURES
@@ -1922,12 +1925,12 @@ struct QMC5883P_data {
  * @param  data  Value to write.
  */
 void QMC5883P_cmd(uint8_t reg, uint8_t data) {
-    uint8_t buffer[2];
+  uint8_t buffer[2];
 
-    buffer[0] = reg;
-    buffer[1] = data;
-    // Uses the I2C subsystem to safely handle Start/Stop/Ack
-    I2C_Write(QMC5883P_I2C_ADDR, buffer, 2);
+  buffer[0] = reg;
+  buffer[1] = data;
+  // Uses the I2C subsystem to safely handle Start/Stop/Ack
+  I2C_Write(QMC5883P_I2C_ADDR, buffer, 2);
 }
 
 /* =========================================================================
@@ -1935,36 +1938,53 @@ void QMC5883P_cmd(uint8_t reg, uint8_t data) {
  * ========================================================================= */
 
 /**
- * @brief  Initializes the QMC5883P Sensor.
+ * @brief Initializes the QMC5883P sensor for continuous measurement mode.
  * @details
  * 1. Performs Soft Reset to clear stuck states.
  * 2. Runs Degaussing (Set Only -> Set/Reset On) to align magnetic domains.
- * 3. Configures filters (OSR/ODR) and Range (8G).
- * 4. Ensures the sensor ends in SUSPEND mode.
+ * 3. Configuration of output data rate and oversampling.
+ * 4. Starts continuous measurement mode.
+ *
+ * Continuous mode is used during active compass display windows
+ * because it provides:
+ *  - Stable output
+ *  - No repeated suspend transitions
+ *  - Reduced risk of internal state-machine lockups
+ *
+ * @return true if initialization succeeds, false otherwise.
  */
 void QMC5883P_Init(void) {
-    // 1. SOFT RESET
-    // Resets registers to default. Chip enters Suspend Mode automatically.
-    QMC5883P_cmd(QMC5883P_REG_CONTROL2, QMC5883P_SOFT_RESET);
+  // 1. SOFT RESET
+  // Resets registers to default. Chip enters Suspend Mode automatically.
+  QMC5883P_cmd(QMC5883P_REG_CONTROL2, QMC5883P_SOFT_RESET);
 
-    // Wait for POR (Power On Reset) to complete (~250us per datasheet)
-    _delay_ms(5);
+  // Wait for POR (Power On Reset) to complete (~250us per datasheet)
+  _delay_ms(5);
 
-    // 2. DEGAUSSING SEQUENCE (Domain Alignment)
-    // Step A: Configure Range 8G + Force "Set Only" logic
-    QMC5883P_cmd(QMC5883P_REG_CONTROL2, QMC5883P_CONFIG_CONTROL2 | QMC5883P_SETRESET_SETONLY);
+  // 2: Restore "Set/Reset On" logic (Normal Operation)
+  QMC5883P_cmd(QMC5883P_REG_CONTROL2, QMC5883P_CONFIG_CONTROL2);
 
-    // Allow pulse to settle
-    _delay_ms(2);
+  // 3. CONFIGURE FILTERS (Control 1)
+  QMC5883P_cmd(QMC5883P_REG_CONTROL1, QMC5883P_CONFIG_CONTROL1 | QMC5883P_MODE_CONTINUOUS);
+  _delay_ms(50);
+}
 
-    // Step B: Restore "Set/Reset On" logic (Normal Operation)
-    // Keep Range 8G.
-    QMC5883P_cmd(QMC5883P_REG_CONTROL2, QMC5883P_CONFIG_CONTROL2 | QMC5883P_SETRESET_ON);
-
-    // 3. CONFIGURE FILTERS (Control 1)
-    // We configure the filters, but we leave MODE as SUSPEND (0x00).
-    // OSR=512 (Max), OSR2=8 (Max), ODR=200Hz (Fastest single shot)
-    QMC5883P_cmd(QMC5883P_REG_CONTROL1, QMC5883P_CONFIG_CONTROL1 | QMC5883P_MODE_SUSPEND);
+/**
+ * @brief Places the sensor into low-power suspend mode.
+ * @details
+ * In suspend mode:
+ *   - Measurement engine is stopped
+ *   - Current consumption drops to a few microamps
+ *   - Registers retain configuration
+ *
+ * This function should be called when:
+ *   - Compass display is no longer needed
+ *   - System enters long idle period
+ *
+ * @return true if command succeeds, false otherwise.
+ */
+void QMC5883P_sleep(void) {
+  QMC5883P_cmd(QMC5883P_REG_CONTROL1, QMC5883P_MODE_SUSPEND);
 }
 
 /**
@@ -1979,41 +1999,40 @@ void QMC5883P_Init(void) {
  * @return true if read successful, false if I2C error or device not ready.
  */
 bool QMC5883P_read(struct QMC5883P_data *pData) {
-    uint8_t buffer[6]; // Buffer for X(2), Y(2), Z(2)
+  if (pData == NULL)
+    return false;
 
-    if (pData == NULL)
-        return false;
+  uint8_t status;
+  uint8_t buffer[7]; // Buffer for ID, X(2), Y(2), Z(2)
+  uint16_t timeout = 10000; // 100 * 100us = 10ms timeout
 
-    // 1. TRIGGER MEASUREMENT (Single Mode)
-    // Must preserve OSR/ODR settings, but change Mode bits to Single (0x02)
-    QMC5883P_cmd(QMC5883P_REG_CONTROL1, QMC5883P_CONFIG_CONTROL1 | QMC5883P_MODE_SINGLE);
+  // Wait for DRDY
+  if (I2C_Read(QMC5883P_I2C_ADDR, QMC5883P_REG_STATUS, &status, 1) != I2C_STATUS_OK)
+    return false;
+  if (!(status & QMC5883P_STATUS_DRDY))
+    return false;
 
-    // 2. WAIT FOR MEASUREMENT
-    // At 200Hz ODR, 1 sample takes ~5ms. We wait 6ms to be safe.
-    _delay_ms(6);
+  // 3. READ DATA REGISTERS
+  // We read 7 bytes starting from 0x00 (REG_CHIPID).
+  // This forces the internal pointer to align correctly,
+  if (I2C_Read(QMC5883P_I2C_ADDR, QMC5883P_REG_CHIPID, buffer, 7) != I2C_STATUS_OK)
+    return false;
 
-    // 3. READ DATA REGISTERS
-    // Burst read 6 bytes starting from 0x01 (X_LSB)
-    if (I2C_Read(QMC5883P_I2C_ADDR, QMC5883P_REG_X_LSB, buffer, 6) != I2C_STATUS_OK)
-        return false;
+  // 4. PARSE DATA
+  // Data is Little Endian (LSB at lower address).
+  // Explicit casting ensures 16-bit reconstruction before signed interpretation.
+  // Order: X_LSB, X_MSB, Y_LSB, Y_MSB, Z_LSB, Z_MSB
 
-    // NOTE: Sensor is now automatically in SUSPEND mode.
+  int16_t raw_x = (int16_t) (buffer[1] | ((uint16_t) buffer[2] << 8));
+  int16_t raw_y = (int16_t) (buffer[3] | ((uint16_t) buffer[4] << 8));
+  int16_t raw_z = (int16_t) (buffer[5] | ((uint16_t) buffer[6] << 8));
 
-    // 4. PARSE DATA
-    // Data is Little Endian (LSB at lower address).
-    // Explicit casting ensures 16-bit reconstruction before signed interpretation.
-    // Order: X_LSB, X_MSB, Y_LSB, Y_MSB, Z_LSB, Z_MSB
+  // convert units to milli Gauss
+  pData->x = (int32_t) raw_x * 1000 / QMC5883P_CONFIG_SENSITIVITY;
+  pData->y = (int32_t) raw_y * 1000 / QMC5883P_CONFIG_SENSITIVITY;
+  pData->z = (int32_t) raw_z * 1000 / QMC5883P_CONFIG_SENSITIVITY;
 
-    pData->x = (int16_t)(buffer[0] | ((uint16_t) buffer[1] << 8));
-    pData->y = (int16_t)(buffer[2] | ((uint16_t) buffer[3] << 8));
-    pData->z = (int16_t)(buffer[4] | ((uint16_t) buffer[5] << 8));
-
-    // convert units to milli Gauss
-    pData->x = (int32_t) pData->x * 1000 / QMC5883P_CONFIG_SENSITIVITY;
-    pData->y = (int32_t) pData->y * 1000 / QMC5883P_CONFIG_SENSITIVITY;
-    pData->z = (int32_t) pData->z * 1000 / QMC5883P_CONFIG_SENSITIVITY;
-
-    return true;
+  return true;
 }
 
 ////////////////////////////
@@ -3018,6 +3037,7 @@ void turnEffectsOn() {
 void turnEffectsOff() {
   // --- SHUTDOWN PERIPHERALS ---
   SSD1306_Sleep();
+  QMC5883P_sleep();
   BME280_Sleep();
   sonic_noTone();
   digitalWrite(LED_PIN, HIGH);// Turn LED OFF
