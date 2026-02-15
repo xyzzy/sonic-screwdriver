@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 ## [Unreleased]
 
 ```
+2026-02-15 21:37:41 Reordered sub-systems.
 2026-02-15 21:19:19 I2C_Status_t is replaced with `bool`.
 2026-02-14 23:22:49 Added mod selector. long hold = trobbing, short hold = flashlight.
 2026-02-14 20:26:10 Put compass in continuous mode and probe DRDY to mitigate spurious read errors.
