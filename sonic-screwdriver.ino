@@ -124,14 +124,6 @@
 #define MASK_SDA ((uint8_t)(1U << PIN_SDA))
 #define MASK_SCL ((uint8_t)(1U << PIN_SCL))
 
-// Status Codes
-typedef enum {
-    I2C_STATUS_OK           = 0, // Transaction successful
-    I2C_STATUS_NACK         = 1, // Target returned NACK
-    I2C_STATUS_NULL_PTR     = 3, // User passed NULL pointer
-    I2C_STATUS_INVALID_LEN  = 4, // User requested 0 length
-} I2C_Status_t;
-
 /* =========================================================================
  *                     PHYSICAL LAYER FUNCTIONS
  * ========================================================================= */
@@ -426,45 +418,6 @@ void I2C_Init(void) {
 }
 
 /**
- * @brief  Writes a buffer of data to a specific Target.
- * @details
- * Transaction: [START] [ADDR+W] [DATA 0] ... [DATA N] [STOP]
- *
- * @param  dev_addr  7-bit Target Address.
- * @param  p_data    Pointer to source buffer.
- * @param  length    Number of bytes to write.
- * @return I2C_Status_t result (OK, NACK, NULL_PTR, INVALID_LEN).
- */
-I2C_Status_t I2C_Transmit(uint8_t dev_addr, const uint8_t *p_data, uint8_t length) {
-    I2C_Status_t status = I2C_STATUS_OK;
-
-    // Rule 17.x: Parameter Checks
-    if (p_data == NULL)
-        return I2C_STATUS_NULL_PTR;
-    if (length == 0)
-        return I2C_STATUS_INVALID_LEN;
-
-    // 1. Start + Address
-    if (I2C_Start(dev_addr, false) == false) {
-        I2C_Stop();
-        return I2C_STATUS_NACK;
-    }
-
-    // 2. Data Payload
-    for (uint8_t i = 0; i < length; i++) {
-        if (I2C_Transmit(p_data[i]) == false) {
-            status = I2C_STATUS_NACK;
-            break; // Stop transmitting on error
-        }
-    }
-
-    // 3. Stop
-    I2C_Stop();
-
-    return status;
-}
-
-/**
  * @brief  Reads data from a Target Register.
  * @details
  * Transaction: [START] [ADDR+W] [REG_ADDR] [RESTART] [ADDR+R] [DATA...] [STOP]
@@ -474,33 +427,34 @@ I2C_Status_t I2C_Transmit(uint8_t dev_addr, const uint8_t *p_data, uint8_t lengt
  * @param  reg_addr  Register address to read from.
  * @param  p_data    Pointer to destination buffer.
  * @param  length    Number of bytes to read.
- * @return I2C_Status_t result.
+ * @return bool      Result false=error/NACK true=ACK
  */
-I2C_Status_t I2C_Read(uint8_t dev_addr, uint8_t reg_addr, uint8_t *p_data, uint8_t length) {
-    I2C_Status_t status = I2C_STATUS_OK;
+bool I2C_Read(uint8_t dev_addr, uint8_t reg_addr, uint8_t *p_data, uint8_t length) {
+    bool status = true;
 
     if (p_data == NULL)
-        return I2C_STATUS_NULL_PTR;
+        return false;
     if (length == 0)
-        return I2C_STATUS_INVALID_LEN;
+        return false;
 
     // 1. Write Phase: Set Register Pointer
-    if (I2C_Start(dev_addr, false) == false) {
+    if (!I2C_Start(dev_addr, false)) {
         I2C_Stop();
-        return I2C_STATUS_NACK;
+        return false;
     }
 
     // Transmit Register Address
-    if (I2C_Transmit(reg_addr) == false) {
+    if (!I2C_Transmit(reg_addr)) {
+        // NACK
         I2C_Stop();
-        return I2C_STATUS_NACK;
+        return false;
     }
 
     // 2. Read Phase: Restart (Start without previous Stop)
     // We send START again to switch to Read Mode
-    if (I2C_Start(dev_addr, true) == false) {
+    if (!I2C_Start(dev_addr, true)) {
         I2C_Stop();
-        return I2C_STATUS_NACK;
+        return false;
     }
 
     // Receive Payload
@@ -526,29 +480,30 @@ I2C_Status_t I2C_Read(uint8_t dev_addr, uint8_t reg_addr, uint8_t *p_data, uint8
  * @param  dev_addr  7-bit Target Address.
  * @param  p_data    Pointer to source buffer.
  * @param  length    Number of bytes to write.
- * @return I2C_Status_t result (OK, NACK, NULL_PTR, INVALID_LEN).
+ * @return bool      Result false=error/NACK true=ACK
  */
-I2C_Status_t I2C_Write(uint8_t dev_addr, const uint8_t *p_data, uint8_t length)
+bool I2C_Write(uint8_t dev_addr, const uint8_t *p_data, uint8_t length)
 {
-    I2C_Status_t status = I2C_STATUS_OK;
+    bool status = true;
 
     // Rule 17.x: Parameter Checks
     if (p_data == NULL)
-        return I2C_STATUS_NULL_PTR;
+        return false;
     if (length == 0)
-        return I2C_STATUS_INVALID_LEN;
+        return false;
 
     // 1. Start + Address
     // 'false' indicates Write Mode (R/W bit = 0)
-    if (I2C_Start(dev_addr, false) == false) {
+    if (!I2C_Start(dev_addr, false)) {
         I2C_Stop();
-        return I2C_STATUS_NACK;
+        return false;
     }
 
     // 2. Data Payload
     for (uint8_t i = 0; i < length; i++) {
-        if (I2C_Transmit(p_data[i]) == false) {
-            status = I2C_STATUS_NACK;
+        if (!I2C_Transmit(p_data[i])) {
+	    // NACK
+            status = false;
             break; // Stop transmitting immediately on error
         }
     }
@@ -2008,7 +1963,7 @@ bool QMC5883P_read(struct QMC5883P_data *pData) {
   uint16_t timeout = 10000; // 100 * 100us = 10ms timeout
 
   // Wait for DRDY
-  if (I2C_Read(QMC5883P_I2C_ADDR, QMC5883P_REG_STATUS, &status, 1) != I2C_STATUS_OK)
+  if (!I2C_Read(QMC5883P_I2C_ADDR, QMC5883P_REG_STATUS, &status, 1))
     return false;
   if (!(status & QMC5883P_STATUS_DRDY))
     return false;
@@ -2016,7 +1971,7 @@ bool QMC5883P_read(struct QMC5883P_data *pData) {
   // 3. READ DATA REGISTERS
   // We read 7 bytes starting from 0x00 (REG_CHIPID).
   // This forces the internal pointer to align correctly,
-  if (I2C_Read(QMC5883P_I2C_ADDR, QMC5883P_REG_CHIPID, buffer, 7) != I2C_STATUS_OK)
+  if (!I2C_Read(QMC5883P_I2C_ADDR, QMC5883P_REG_CHIPID, buffer, 7))
     return false;
 
   // 4. PARSE DATA
@@ -2119,16 +2074,16 @@ void BME280_Init(void) {
 
     // Step A: Set Humidity Oversampling (x1) to Reg 0xF2
     uint8_t ctrl_hum[] = { 0xF2, 0x01 };
-    I2C_Transmit(BME280_ADDR, ctrl_hum, 2);
+    I2C_Write(BME280_ADDR, ctrl_hum, 2);
 
     // Step B: Set Temp/Press Oversampling + Mode to Reg 0xF4
     // Note: Writing this register activates the changes in ctrl_hum
     uint8_t ctrl_meas[] = { 0xF4, 0x27 }; // Normal Mode, x1 Temp, x1 Press
-    I2C_Transmit(BME280_ADDR, ctrl_meas, 2);
+    I2C_Write(BME280_ADDR, ctrl_meas, 2);
 
     // Step C: Config (Standby 1000ms)
     uint8_t config[] = { 0xF5, 0xA0 };
-    I2C_Transmit(BME280_ADDR, config, 2);
+    I2C_Write(BME280_ADDR, config, 2);
 }
 
 void BME280_Sleep(void) {
@@ -2136,7 +2091,7 @@ void BME280_Sleep(void) {
     // Mode 00 = Sleep
     // We write 0x00 to turn off Oversampling and Mode
     uint8_t data[] = { 0xF4, 0x00 };
-    I2C_Transmit(BME280_ADDR, data, 2);
+    I2C_Write(BME280_ADDR, data, 2);
 }
 
 void BME280_Wake(void) {
@@ -2145,7 +2100,7 @@ void BME280_Wake(void) {
     // Reg 0xF4: x1 Temp (001), x1 Press (001), Normal Mode (11) -> 0x27
     // Or Forced Mode (01) -> 0x25
     uint8_t data[] = { 0xF4, 0x27 };
-    I2C_Transmit(BME280_ADDR, data, 2);
+    I2C_Write(BME280_ADDR, data, 2);
 }
 
 int16_t BME280_ReadTemp(void) {
