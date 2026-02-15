@@ -11,6 +11,206 @@
 
 /*
  * =========================================================================================
+ * FIXED POINT TRIGONOMETRY SUBSYSTEM
+ * =========================================================================================
+ *
+ * THE PROBLEM:
+ * ------------
+ * The ATtiny85 (and Arduino Uno) has no FPU (Floating Point Unit).
+ * Calculating `sin(angle)` using standard `math.h` (`float` or `double`) triggers
+ * software emulation. This consumes ~2KB of Flash and takes thousands of cycles
+ * per calculation, causing the OLED display to lag visibly.
+ *
+ * THE SOLUTION: INTEGER LOOK-UP TABLE (LUT)
+ * -----------------------------------------
+ * We pre-calculate the Sine values for 0 to 90 degrees and store them in Flash (PROGMEM).
+ * We use the mathematical symmetry of the unit circle to derive 91-360 degrees.
+ *
+ * SCALING FACTOR (FIXED POINT):
+ * -----------------------------
+ * Instead of returning a float 0.0 to 1.0, we return an integer -127 to +127.
+ * - Value   0 represents 0.0
+ * - Value 127 represents 1.0
+ *
+ * To use the result in a calculation:
+ * Result = (Input * sinInt(angle)) / 127;
+ *
+ * Or, for faster bit-shifting (Power of 2):
+ * If we treat 127 as "almost 128", we can bit-shift >> 7.
+ * For the compass rotation, we scale this further to Q8.8 (256 base) via left-shifting.
+ * =========================================================================================
+ */
+
+/*
+ * Sine Look-Up Table (0 to 90 degrees).
+ * Range: 0 to 127.
+ *
+ * Why only 0-90?
+ * A sine wave is symmetrical.
+ * - Quadrant 1 (0-90):   Values increase 0 -> 1.
+ * - Quadrant 2 (91-180): Values decrease 1 -> 0 (Mirror of Q1).
+ * - Quadrant 3 (181-270): Values decrease 0 -> -1 (Negative Mirror of Q1).
+ * - Quadrant 4 (271-360): Values increase -1 -> 0 (Negative Mirror of Q1).
+ *
+ * Storing only 91 bytes saves 270 bytes of Flash memory.
+ */
+static const int8_t sin_LUT[] PROGMEM = {
+  0, 2, 4, 7, 9, 11, 13, 15, 18, 20,
+  22, 24, 26, 29, 31, 33, 35, 37, 39, 41,
+  43, 46, 48, 50, 52, 54, 56, 58, 60, 62,
+  64, 65, 67, 69, 71, 73, 75, 76, 78, 80,
+  82, 83, 85, 87, 88, 90, 91, 93, 94, 96,
+  97,  99, 100, 101, 103, 104, 105, 107, 108, 109,
+  110, 111, 112, 113, 114, 115, 116, 117, 118, 119,
+  119, 120, 121, 121, 122, 123, 123, 124, 124, 125,
+  125, 125, 126, 126, 126, 127, 127, 127, 127, 127,
+};
+
+/**
+ * @brief  Calculates the Sine of an angle using Integer Math.
+ *
+ * @param  angle  Input angle in degrees.
+ *                Accepted Range: -32768 to +32767.
+ *                (Ideally 0-359 for speed).
+ *
+ * @return int8_t Scaled Sine value (-127 to +127).
+ */
+static int8_t sin_deg(int16_t angle) {
+  /*
+   * 1. INPUT NORMALIZATION
+   * ----------------------
+   * We need the angle to be in the range [0, 359].
+   *
+   * Optimization Note:
+   * On an 8-bit AVR, the modulo operator (%) involves a software division library
+   * which is slow (~100-200 cycles).
+   * Since compass headings usually change incrementally (e.g., 359 -> 360),
+   * a `while` loop subtract/add is significantly faster than division.
+   */
+  while (angle < 0)
+    angle += 360;
+  while (angle >= 360)
+    angle -= 360;
+
+  /*
+   * 2. QUADRANT MAPPING
+   * -------------------
+   * Map the 0-359 angle to the 0-90 lookup table index.
+   */
+
+  /* Quadrant 1: 0 to 90 degrees */
+  if (angle < 90) {
+    /* Direct Lookup */
+    return (int8_t) pgm_read_byte(&sin_LUT[angle]);
+  }
+
+  /* Quadrant 2: 91 to 180 degrees */
+  if (angle < 180) {
+    /* Mirror Horizontal: sin(170) == sin(10) */
+    return (int8_t) pgm_read_byte(&sin_LUT[179 - angle]);
+  }
+
+  /* Quadrant 3: 181 to 270 degrees */
+  if (angle < 270) {
+    /* Mirror Vertical: sin(190) == -sin(10) */
+    /* Note: We read the positive value, then negate the result. */
+    return -(int8_t) pgm_read_byte(&sin_LUT[angle - 180]);
+  }
+
+  return -(int8_t) pgm_read_byte(&sin_LUT[359 - angle]);
+}
+
+/**
+ * @brief  Calculates the Cosine of an angle using Integer Math.
+ *
+ * @details
+ * Relies on the trigonometric identity: cos(x) = sin(x + 90).
+ * This allows us to reuse the exact same LUT and normalization logic
+ * without consuming extra Flash memory for a Cosine table.
+ *
+ * @param  angle  Input angle in degrees.
+ * @return int8_t Scaled Cosine value (-127 to +127).
+ */
+static int8_t cos_deg(int16_t angle) {
+  // cos(x) is just sin(x + 90)
+  return sin_deg(angle + 90);
+}
+
+/**
+ * @brief  Computes approximate angle in degrees (0-359).
+ *
+ * OPTIMIZATION STRATEGY:
+ * 1. SYMMETRY: We only calculate the angle for 0-45 degrees (Slope 0.0 to 1.0).
+ *              We map the other 7 octants using simple subtraction.
+ *
+ * 2. LINEAR APPROXIMATION:
+ *    Real formula: theta = atan(y/x)
+ *    Linear approx: theta ~= 45 * (y/x)
+ *    Error: Max ~4 degrees at 22.5 degrees. Acceptable for visual compass.
+ *
+ * 3. 16-BIT MATH:
+ *    To calculate (y * 45) / x without overflowing 16-bit integers (max 32767),
+ *    inputs are bit-shifted down until they fit. This avoids linking the heavy
+ *    32-bit division library.
+ *
+ * @param  y  Signed 16-bit Y component.
+ * @param  x  Signed 16-bit X component.
+ * @return uint16_t Angle in degrees.
+ */
+uint16_t atan2_deg(int16_t y, int16_t x) {
+  // 1. Handle special case (Origin)
+  if (x == 0 && y == 0) return 0;
+
+  // 2. Get Absolute Values
+  // Cast to unsigned to safely handle -32768
+  uint16_t ax = (x < 0) ? (uint16_t)(-x) : (uint16_t)x;
+  uint16_t ay = (y < 0) ? (uint16_t)(-y) : (uint16_t)y;
+
+  // 3. Determine Min/Max for the 0-45 degree ratio
+  uint16_t mn = (ax < ay) ? ax : ay;
+  uint16_t mx = (ax > ay) ? ax : ay;
+
+  // 4. Pre-scale to prevent overflow
+  // We need to calculate (mn * 45) / mx.
+  // (mn * 45) must fit in uint16_t (< 65535).
+  // Therefore, mn must be < 1456 (65535 / 45).
+  while (mx > 1400) {
+    mx >>= 1;
+    mn >>= 1;
+  }
+
+  // 5. Calculate Octant Angle (0-45 degrees)
+  // Formula: angle = slope * 45
+  // Note: If mx is 0 (should be impossible handled by step 1), result is 0.
+  uint16_t angle = (mn * 45) / mx;
+
+  // 6. Map Octant to Circle (0-360)
+  if (x >= 0) {
+    if (y >= 0) {
+      // Quadrant 1 (x+, y+)
+      if (ax >= ay) return angle;          // 0-45
+      else          return 90 - angle;     // 45-90
+    } else {
+      // Quadrant 4 (x+, y-)
+      if (ax < ay) return 270 + angle;    // 315-360
+      else if (angle == 0) return 0;
+      else return 360 - angle;            // 270-315
+    }
+  } else {
+    if (y >= 0) {
+      // Quadrant 2 (x-, y+)
+      if (ax >= ay) return 180 - angle;    // 135-180
+      else          return 90 + angle;     // 90-135
+    } else {
+      // Quadrant 3 (x-, y-)
+      if (ax >= ay) return 180 + angle;    // 180-225
+      else          return 270 - angle;    // 225-270
+    }
+  }
+}
+
+/*
+ * =========================================================================================
  * I2C MASTER SUBSYSTEM - BARE METAL BIT-BANG DRIVER
  * =========================================================================================
  *
@@ -688,6 +888,88 @@ uint8_t battery_GetPercentage(uint16_t mv) {
 }
 
 /*
+ * =============================================================================
+ *                    ATTiny85 sleep/standby for low power consumption
+ * BATTERY LIFE ESTIMATION (ATtiny85 + SSD1306 + QMC5883P + BME280 + LED)
+ * =============================================================================
+ *
+ * Components:
+ *   - ATtiny85 MCU
+ *   - SSD1306 OLED
+ *   - Status LED
+ *   - QMC5883P magnetometer
+ *   - BME280 environmental sensor
+ *
+ * Typical currents at 3V:
+ * -----------------------
+ * Sleep Mode (power-down, minimal usage):
+ *   - ATtiny85: 0.5 µA
+ *   - SSD1306: 0 µA (powered down)
+ *   - LED: 0 µA (off)
+ *   - QMC5883P: 1 µA (shutdown)
+ *   - BME280: 0.1 µA (low-power)
+ *   -> Total sleep current: I_sleep ≈ 1.6 µA ≈ 0.0016 mA
+ *
+ * Active Mode (everything running):
+ *   - ATtiny85: 5 mA
+ *   - SSD1306: 15 mA
+ *   - LED: 5 mA
+ *   - QMC5883P: 0.1 mA
+ *   - BME280: 0.03 mA
+ *   -> Total active current: I_active ≈ 25.13 mA
+ *
+ * Battery: CR2032, typical capacity 225 mAh
+ *
+ * ============================================================================
+ * MAXIMUM BATTERY LIFE (full sleep, everything off except MCU + sensors in low power)
+ * ============================================================================
+ * I_sleep = 0.0016 mA
+ * Battery life ≈ Capacity / Current
+ * Battery life ≈ 225 mAh / 0.0016 mA ≈ 140,625 hours
+ * Convert to years: 140,625 / 24 / 365 ≈ 16 years (!!)
+ * Note: This is theoretical; real-world factors like self-discharge, leakage,
+ *       and temperature reduce practical life.
+ *
+ * ============================================================================
+ * MINIMUM BATTERY LIFE (full active, everything running continuously)
+ * ============================================================================
+ * I_active = 25.13 mA
+ * Battery life ≈ 225 mAh / 25.13 mA ≈ 8.95 hours
+ *
+ * =============================================================================
+ */
+
+// Note: On ATtiny85, all pin changes (PCINT0 to PCINT5)
+// trigger the SAME vector: PCINT0_vect.
+ISR(PCINT0_vect) {
+  // This code runs immediately upon wake-up.
+  // You can leave this empty if you just want to wake up.
+}
+
+void go_to_sleep(void) {
+  byte buttonState;
+
+  do {
+    ADCSRA &= ~(1 << ADEN);               // Disable ADC
+    ACSR |= (1 << ACD);                   // Disable analog comparator
+    power_all_disable();                  // Disable all peripherals
+    PCMSK |= (1 << PCINT1);               // Enable PCINT1
+    GIMSK |= (1 << PCIE);                 // Enable pin change interrupts globally
+    set_sleep_mode(SLEEP_MODE_PWR_DOWN);  // lowest power mode
+    sleep_enable();                       // allow sleep
+    sleep_bod_disable();                  // disable brown-out detection
+    sei();                                // ensure interrupts enabled
+    sleep_cpu();                          // MCU sleeps here
+    sleep_disable();                      // resumes here after wake
+    power_all_enable();                   // Re-enable after wake
+    PCMSK &= ~(1 << PCINT1);              // Disable PCINT1
+
+    // probe pin6
+    buttonState = digitalRead(PB1); // wait until  HIGH to LOW
+  } while (buttonState != LOW);
+}
+
+/*
  * =========================================================================================
  * SSD1306 OLED SUBSYSTEM (128x64 I2C)
  * =========================================================================================
@@ -873,202 +1155,499 @@ void SSD1306_Clear(void) {
 
 /*
  * =========================================================================================
- * FIXED POINT TRIGONOMETRY SUBSYSTEM
+ * QMC5883P MAGNETOMETER SUBSYSTEM
  * =========================================================================================
  *
- * THE PROBLEM:
- * ------------
- * The ATtiny85 (and Arduino Uno) has no FPU (Floating Point Unit).
- * Calculating `sin(angle)` using standard `math.h` (`float` or `double`) triggers
- * software emulation. This consumes ~2KB of Flash and takes thousands of cycles
- * per calculation, causing the OLED display to lag visibly.
+ * 1. DEVICE OVERVIEW
+ * -----------------------------------------------------------------------------------------
+ * - Part Number: QST QMC5883P (Note: 'P' variant is distinct from 'L')
+ * - I2C Address: 0x2C (7-bit)
+ * - Datasheet:   Rev C (13-52-19)
  *
- * THE SOLUTION: INTEGER LOOK-UP TABLE (LUT)
- * -----------------------------------------
- * We pre-calculate the Sine values for 0 to 90 degrees and store them in Flash (PROGMEM).
- * We use the mathematical symmetry of the unit circle to derive 91-360 degrees.
+ * 2. POWER MANAGEMENT STRATEGY (SINGLE SHOT)
+ * -----------------------------------------------------------------------------------------
+ * To maximize battery life on a CR2032, this driver avoids "Continuous Mode".
+ * We utilize the hardware's native "Single Mode" (Forced Mode).
  *
- * SCALING FACTOR (FIXED POINT):
- * -----------------------------
- * Instead of returning a float 0.0 to 1.0, we return an integer -127 to +127.
- * - Value   0 represents 0.0
- * - Value 127 represents 1.0
+ * - IDLE:   The sensor sits in SUSPEND mode (~3uA current).
+ * - ACTIVE: The driver writes 'MODE_SINGLE' to Control Register 1.
+ * - ACTION: The sensor Wakes -> Measures -> Updates Data -> Auto-Suspends.
  *
- * To use the result in a calculation:
- * Result = (Input * sinInt(angle)) / 127;
+ * This provides a fail-safe mechanism: if the microcontroller hangs or crashes,
+ * the sensor will not drain the battery because it automatically returns to sleep.
  *
- * Or, for faster bit-shifting (Power of 2):
- * If we treat 127 as "almost 128", we can bit-shift >> 7.
- * For the compass rotation, we scale this further to Q8.8 (256 base) via left-shifting.
+ * 3. STARTUP DEGAUSSING (HARD IRON / DOMAIN ALIGNMENT)
+ * -----------------------------------------------------------------------------------------
+ * Upon initialization, the driver performs a specific "Set/Reset" sequence.
+ * By forcing a "Set Only" pulse followed by restoring normal "Set/Reset", we generate
+ * a strong magnetic field internally. This re-aligns the magnetic domains of the
+ * Permalloy film, canceling out offsets caused by nearby magnetic components (speaker).
+ *
+ * 4. REGISTER MAPPING (0x2C Variant)
+ * -----------------------------------------------------------------------------------------
+ * 0x00: Chip ID
+ * 0x01-0x06: Data Output (X, Y, Z)
+ * 0x09: Status Register
+ * 0x0A: Control Register 1 (Mode, ODR, OSR, OSR2)
+ * 0x0B: Control Register 2 (Soft Reset, Rollover, Interrupt)
  * =========================================================================================
  */
 
-/*
- * Sine Look-Up Table (0 to 90 degrees).
- * Range: 0 to 127.
- *
- * Why only 0-90?
- * A sine wave is symmetrical.
- * - Quadrant 1 (0-90):   Values increase 0 -> 1.
- * - Quadrant 2 (91-180): Values decrease 1 -> 0 (Mirror of Q1).
- * - Quadrant 3 (181-270): Values decrease 0 -> -1 (Negative Mirror of Q1).
- * - Quadrant 4 (271-360): Values increase -1 -> 0 (Negative Mirror of Q1).
- *
- * Storing only 91 bytes saves 270 bytes of Flash memory.
+// I2C Address
+#define QMC5883P_I2C_ADDR            0x2c
+
+/* =========================================================================
+ *                        REGISTER & ENUM DEFINITIONS
+ * ========================================================================= */
+
+/**
+ * @brief Register Map (Datasheet Page 14)
+ * Note: QMC5883P Control registers are at 0x0A/0x0B (shifted vs QMC5883L)
  */
-static const int8_t sin_LUT[] PROGMEM = {
-	0, 2, 4, 7, 9, 11, 13, 15, 18, 20,
-	22, 24, 26, 29, 31, 33, 35, 37, 39, 41,
-	43, 46, 48, 50, 52, 54, 56, 58, 60, 62,
-	64, 65, 67, 69, 71, 73, 75, 76, 78, 80,
-	82, 83, 85, 87, 88, 90, 91, 93, 94, 96,
-	 97,  99, 100, 101, 103, 104, 105, 107, 108, 109,
-	110, 111, 112, 113, 114, 115, 116, 117, 118, 119,
-	119, 120, 121, 121, 122, 123, 123, 124, 124, 125,
-	125, 125, 126, 126, 126, 127, 127, 127, 127, 127,
+typedef enum {
+    QMC5883P_REG_CHIPID   = 0x00, // Chip ID register
+    QMC5883P_REG_X_LSB    = 0x01, // X-axis output LSB register
+    QMC5883P_REG_X_MSB    = 0x02, // X-axis output MSB register
+    QMC5883P_REG_Y_LSB    = 0x03, // Y-axis output LSB register
+    QMC5883P_REG_Y_MSB    = 0x04, // Y-axis output MSB register
+    QMC5883P_REG_Z_LSB    = 0x05, // Z-axis output LSB register
+    QMC5883P_REG_Z_MSB    = 0x06, // Z-axis output MSB register
+    QMC5883P_REG_STATUS   = 0x09, // Status register
+    QMC5883P_REG_CONTROL1 = 0x0A, // Control register 1 (Mode/ODR/OSR)
+    QMC5883P_REG_CONTROL2 = 0x0B, // Control register 2 (Reset/Config)
+} QMC5883P_register_t;
+
+/**
+ * @brief Status Register Bits (0x09)
+ */
+typedef enum {
+    QMC5883P_STATUS_DRDY = (1 << 0), // Data Ready
+    QMC5883P_STATUS_OVFL = (1 << 1), // Overflow
+} QMC5883P_mode_t;
+
+/**
+ * @brief Control register 1
+ */
+typedef enum {
+    // Operating Mode (Bits 1:0)
+    QMC5883P_MODE_SUSPEND    = 0, // Suspend mode (Low Power, <3uA)
+    QMC5883P_MODE_NORMAL     = 1, // Normal mode (Old term)
+    QMC5883P_MODE_SINGLE     = 2, // Single Measurement (Auto-Sleep)
+    QMC5883P_MODE_CONTINUOUS = 3, // Continuous Read Mode
+
+    // Output Data Rate (Bits 3:2)
+    // In Single Mode, this determines the speed of the one-shot measurement.
+    QMC5883P_ODR_10HZ  = (0 << 2), // 10 Hz output data rate
+    QMC5883P_ODR_50HZ  = (1 << 2), // 50 Hz output data rate
+    QMC5883P_ODR_100HZ = (2 << 2), // 100 Hz output data rate
+    QMC5883P_ODR_200HZ = (3 << 2), // 200 Hz output data rate (Fastest)
+
+    // Over Sample Ratio 1 (Bits 5:4)
+    // Controls bandwidth/noise. Higher OSR = Lower Noise, Higher Current.
+    QMC5883P_OSR_8 = (0 << 4), // OSR = 8 (Best Filtering)
+    QMC5883P_OSR_4 = (1 << 4), // OSR = 4
+    QMC5883P_OSR_2 = (2 << 4), // OSR = 2
+    QMC5883P_OSR_1 = (3 << 4), // OSR = 1 (Lowest Power)
+
+    // Over Sample Ratio 2 / Downsample (Bits 7:6)
+    // Secondary internal filter setting.
+    QMC5883P_OSR2_1 = (0 << 6), // Downsample ratio = 1
+    QMC5883P_OSR2_2 = (1 << 6), // Downsample ratio = 2
+    QMC5883P_OSR2_4 = (2 << 6), // Downsample ratio = 4
+    QMC5883P_OSR2_8 = (3 << 6), // Downsample ratio = 8
+} QMC5883P_control1_t;
+
+/**
+ * @brief Control register 2
+ */
+typedef enum {
+    // Set/Reset Logic (Bits 1:0)
+    // Used for the Degaussing / Domain Alignment sequence.
+    QMC5883P_SETRESET_ON      = 0, // Normal: Set and Reset Pulse On
+    QMC5883P_SETRESET_SETONLY = 1, // Pulse: Set Only (Force logic)
+    QMC5883P_SETRESET_OFF     = 2, // Off: Set and Reset Off
+
+    // Field Range (Bits 3:2)
+    QMC5883P_RANGE_30G = (0 << 2), // +/- 30 Gauss range
+    QMC5883P_RANGE_12G = (1 << 2), // +/- 12 Gauss range
+    QMC5883P_RANGE_8G  = (2 << 2), // +/- 8 Gauss range (Balanced)
+    QMC5883P_RANGE_2G  = (3 << 2), // +/- 2 Gauss range (High Sensitivity)
+
+    // Self test
+    QMC5883P_SELF_TEST  = (1 << 6), // Self test
+    QMC5883P_SOFT_RESET = (1 << 7), // Soft Reset (Reboots chip logic)
+} QMC5883P_control2_t;
+
+/**
+ * @brief Sensor sensitivity LSB/G
+ */
+enum {
+    QMC5883P_SENSITIVITY_2G  = 15000,
+    QMC5883P_SENSITIVITY_8G  = 3750,
+    QMC5883P_SENSITIVITY_12G = 2500,
+    QMC5883P_SENSITIVITY_30G = 1000,
 };
 
+enum {
+    QMC5883P_CONFIG_CONTROL1 = QMC5883P_OSR_8 |   // Lower current moderate noise filtering
+			       QMC5883P_OSR2_8 |  // Light secondary downsampling
+			       QMC5883P_ODR_50HZ, // 50 Hz is visually smooth enough
+
+    QMC5883P_CONFIG_CONTROL2 = QMC5883P_RANGE_8G, // ±8 Gauss range (balanced)
+
+    QMC5883P_CONFIG_SENSITIVITY = QMC5883P_SENSITIVITY_8G // 3750 LSB/G
+};
+
+/* =========================================================================
+ *                            DATA STRUCTURES
+ * ========================================================================= */
+
 /**
- * @brief  Calculates the Sine of an angle using Integer Math.
- *
- * @param  angle  Input angle in degrees.
- *                Accepted Range: -32768 to +32767.
- *                (Ideally 0-359 for speed).
- *
- * @return int8_t Scaled Sine value (-127 to +127).
+ * @brief Container for the 3-axis magnetic data.
+ *        units are in milli Gauss
  */
-static int8_t sin_deg(int16_t angle) {
-    /*
-     * 1. INPUT NORMALIZATION
-     * ----------------------
-     * We need the angle to be in the range [0, 359].
-     *
-     * Optimization Note:
-     * On an 8-bit AVR, the modulo operator (%) involves a software division library
-     * which is slow (~100-200 cycles).
-     * Since compass headings usually change incrementally (e.g., 359 -> 360),
-     * a `while` loop subtract/add is significantly faster than division.
-     */
-    while (angle < 0)
-        angle += 360;
-    while (angle >= 360)
-        angle -= 360;
+struct QMC5883P_data {
+    int16_t x;
+    int16_t y;
+    int16_t z;
+} ;
 
-    /*
-     * 2. QUADRANT MAPPING
-     * -------------------
-     * Map the 0-359 angle to the 0-90 lookup table index.
-     */
+/* =========================================================================
+ *                           PRIVATE FUNCTIONS
+ * ========================================================================= */
 
-    /* Quadrant 1: 0 to 90 degrees */
-    if (angle < 90) {
-        /* Direct Lookup */
-        return (int8_t) pgm_read_byte(&sin_LUT[angle]);
-    }
+/**
+ * @brief  Writes a byte to a specific register on the QMC5883P.
+ * @details Wrapper for the I2C Write transaction.
+ * @param  reg   Register Address.
+ * @param  data  Value to write.
+ */
+void QMC5883P_cmd(uint8_t reg, uint8_t data) {
+  uint8_t buffer[2];
 
-    /* Quadrant 2: 91 to 180 degrees */
-    if (angle < 180) {
-        /* Mirror Horizontal: sin(170) == sin(10) */
-        return (int8_t) pgm_read_byte(&sin_LUT[179 - angle]);
-    }
-
-    /* Quadrant 3: 181 to 270 degrees */
-    if (angle < 270) {
-        /* Mirror Vertical: sin(190) == -sin(10) */
-        /* Note: We read the positive value, then negate the result. */
-        return -(int8_t) pgm_read_byte(&sin_LUT[angle - 180]);
-    }
-
-    return -(int8_t) pgm_read_byte(&sin_LUT[359 - angle]);
+  buffer[0] = reg;
+  buffer[1] = data;
+  // Uses the I2C subsystem to safely handle Start/Stop/Ack
+  I2C_Write(QMC5883P_I2C_ADDR, buffer, 2);
 }
 
+/* =========================================================================
+ *                           PUBLIC API FUNCTIONS
+ * ========================================================================= */
+
 /**
- * @brief  Calculates the Cosine of an angle using Integer Math.
- *
+ * @brief Initializes the QMC5883P sensor for continuous measurement mode.
  * @details
- * Relies on the trigonometric identity: cos(x) = sin(x + 90).
- * This allows us to reuse the exact same LUT and normalization logic
- * without consuming extra Flash memory for a Cosine table.
+ * 1. Performs Soft Reset to clear stuck states.
+ * 2. Runs Degaussing (Set Only -> Set/Reset On) to align magnetic domains.
+ * 3. Configuration of output data rate and oversampling.
+ * 4. Starts continuous measurement mode.
  *
- * @param  angle  Input angle in degrees.
- * @return int8_t Scaled Cosine value (-127 to +127).
+ * Continuous mode is used during active compass display windows
+ * because it provides:
+ *  - Stable output
+ *  - No repeated suspend transitions
+ *  - Reduced risk of internal state-machine lockups
+ *
+ * @return true if initialization succeeds, false otherwise.
  */
-static int8_t cos_deg(int16_t angle) {
-    // cos(x) is just sin(x + 90)
-    return sin_deg(angle + 90);
+void QMC5883P_Init(void) {
+  // 1. SOFT RESET
+  // Resets registers to default. Chip enters Suspend Mode automatically.
+  QMC5883P_cmd(QMC5883P_REG_CONTROL2, QMC5883P_SOFT_RESET);
+
+  // Wait for POR (Power On Reset) to complete (~250us per datasheet)
+  _delay_ms(5);
+
+  // 2: Restore "Set/Reset On" logic (Normal Operation)
+  QMC5883P_cmd(QMC5883P_REG_CONTROL2, QMC5883P_CONFIG_CONTROL2);
+
+  // 3. CONFIGURE FILTERS (Control 1)
+  QMC5883P_cmd(QMC5883P_REG_CONTROL1, QMC5883P_CONFIG_CONTROL1 | QMC5883P_MODE_CONTINUOUS);
+  _delay_ms(50);
 }
 
 /**
- * @brief  Computes approximate angle in degrees (0-359).
+ * @brief Places the sensor into low-power suspend mode.
+ * @details
+ * In suspend mode:
+ *   - Measurement engine is stopped
+ *   - Current consumption drops to a few microamps
+ *   - Registers retain configuration
  *
- * OPTIMIZATION STRATEGY:
- * 1. SYMMETRY: We only calculate the angle for 0-45 degrees (Slope 0.0 to 1.0).
- *              We map the other 7 octants using simple subtraction.
+ * This function should be called when:
+ *   - Compass display is no longer needed
+ *   - System enters long idle period
  *
- * 2. LINEAR APPROXIMATION:
- *    Real formula: theta = atan(y/x)
- *    Linear approx: theta ~= 45 * (y/x)
- *    Error: Max ~4 degrees at 22.5 degrees. Acceptable for visual compass.
- *
- * 3. 16-BIT MATH:
- *    To calculate (y * 45) / x without overflowing 16-bit integers (max 32767),
- *    inputs are bit-shifted down until they fit. This avoids linking the heavy
- *    32-bit division library.
- *
- * @param  y  Signed 16-bit Y component.
- * @param  x  Signed 16-bit X component.
- * @return uint16_t Angle in degrees.
+ * @return true if command succeeds, false otherwise.
  */
-uint16_t atan2_deg(int16_t y, int16_t x) {
-    // 1. Handle special case (Origin)
-    if (x == 0 && y == 0) return 0;
+void QMC5883P_sleep(void) {
+  QMC5883P_cmd(QMC5883P_REG_CONTROL1, QMC5883P_MODE_SUSPEND);
+}
 
-    // 2. Get Absolute Values
-    // Cast to unsigned to safely handle -32768
-    uint16_t ax = (x < 0) ? (uint16_t)(-x) : (uint16_t)x;
-    uint16_t ay = (y < 0) ? (uint16_t)(-y) : (uint16_t)y;
+/**
+ * @brief  Performs a Single-Shot measurement and reads data.
+ * @details
+ * 1. Wakes sensor by setting MODE_SINGLE.
+ * 2. Waits for measurement completion (Fixed delay).
+ * 3. Reads Data registers.
+ * 4. Sensor automatically returns to SUSPEND mode (Hardware feature).
+ *
+ * @param[out] pData  Pointer to QMC5883P_data_t structure.
+ * @return true if read successful, false if I2C error or device not ready.
+ */
+bool QMC5883P_read(struct QMC5883P_data *pData) {
+  if (pData == NULL)
+    return false;
 
-    // 3. Determine Min/Max for the 0-45 degree ratio
-    uint16_t mn = (ax < ay) ? ax : ay;
-    uint16_t mx = (ax > ay) ? ax : ay;
+  uint8_t status;
+  uint8_t buffer[7]; // Buffer for ID, X(2), Y(2), Z(2)
+  uint16_t timeout = 10000; // 100 * 100us = 10ms timeout
 
-    // 4. Pre-scale to prevent overflow
-    // We need to calculate (mn * 45) / mx.
-    // (mn * 45) must fit in uint16_t (< 65535).
-    // Therefore, mn must be < 1456 (65535 / 45).
-    while (mx > 1400) {
-        mx >>= 1;
-        mn >>= 1;
-    }
+  // Wait for DRDY
+  if (!I2C_Read(QMC5883P_I2C_ADDR, QMC5883P_REG_STATUS, &status, 1))
+    return false;
+  if (!(status & QMC5883P_STATUS_DRDY))
+    return false;
 
-    // 5. Calculate Octant Angle (0-45 degrees)
-    // Formula: angle = slope * 45
-    // Note: If mx is 0 (should be impossible handled by step 1), result is 0.
-    uint16_t angle = (mn * 45) / mx;
+  // 3. READ DATA REGISTERS
+  // We read 7 bytes starting from 0x00 (REG_CHIPID).
+  // This forces the internal pointer to align correctly,
+  if (!I2C_Read(QMC5883P_I2C_ADDR, QMC5883P_REG_CHIPID, buffer, 7))
+    return false;
 
-    // 6. Map Octant to Circle (0-360)
-    if (x >= 0) {
-        if (y >= 0) {
-            // Quadrant 1 (x+, y+)
-            if (ax >= ay) return angle;          // 0-45
-            else          return 90 - angle;     // 45-90
-        } else {
-            // Quadrant 4 (x+, y-)
-	  if (ax < ay) return 270 + angle;    // 315-360
-	  else if (angle == 0) return 0;
-	  else return 360 - angle;            // 270-315
-	}
-    } else {
-        if (y >= 0) {
-            // Quadrant 2 (x-, y+)
-            if (ax >= ay) return 180 - angle;    // 135-180
-            else          return 90 + angle;     // 90-135
-        } else {
-            // Quadrant 3 (x-, y-)
-            if (ax >= ay) return 180 + angle;    // 180-225
-            else          return 270 - angle;    // 225-270
-        }
-    }
+  // 4. PARSE DATA
+  // Data is Little Endian (LSB at lower address).
+  // Explicit casting ensures 16-bit reconstruction before signed interpretation.
+  // Order: X_LSB, X_MSB, Y_LSB, Y_MSB, Z_LSB, Z_MSB
+
+  int16_t raw_x = (int16_t) (buffer[1] | ((uint16_t) buffer[2] << 8));
+  int16_t raw_y = (int16_t) (buffer[3] | ((uint16_t) buffer[4] << 8));
+  int16_t raw_z = (int16_t) (buffer[5] | ((uint16_t) buffer[6] << 8));
+
+  // convert units to milli Gauss
+  pData->x = (int32_t) raw_x * 1000 / QMC5883P_CONFIG_SENSITIVITY;
+  pData->y = (int32_t) raw_y * 1000 / QMC5883P_CONFIG_SENSITIVITY;
+  pData->z = (int32_t) raw_z * 1000 / QMC5883P_CONFIG_SENSITIVITY;
+
+  return true;
+}
+
+////////////////////////////
+
+#define BME280_ADDR         0x76 // Check your module: 0x76 (SDO=GND) or 0x77 (SDO=VCC)
+
+// Registers
+#define BME280_REG_DIG_T1   0x88 // Start of Temp Calibration
+#define BME280_REG_ID       0xD0
+#define BME280_REG_CTRL     0xF4 // Control Measurement
+#define BME280_REG_TEMP     0xFA // Temp MSB
+// Add Pressure Registers
+#define BME280_REG_DIG_P1   0x8E
+#define BME280_REG_PRESS    0xF7 // Pressure MSB
+// Add Humidity Registers
+#define BME280_REG_CTRL_HUM 0xF2
+#define BME280_REG_HUM_MSB  0xFD
+
+typedef struct {
+    // Temp (0x88)
+    uint16_t dig_T1;
+    int16_t  dig_T2;
+    int16_t  dig_T3;
+    // Pressure (0x8E)
+    uint16_t dig_P1;
+    int16_t  dig_P2; int16_t  dig_P3; int16_t  dig_P4;
+    int16_t  dig_P5; int16_t  dig_P6; int16_t  dig_P7;
+    int16_t  dig_P8; int16_t  dig_P9;
+
+    // Humidity (Fragmented)
+    uint8_t  dig_H1; // 0xA1
+    int16_t  dig_H2; // 0xE1
+    uint8_t  dig_H3; // 0xE3
+    int16_t  dig_H4; // 0xE4 + 0xE5[3:0]
+    int16_t  dig_H5; // 0xE6 + 0xE5[7:4]
+    int8_t   dig_H6; // 0xE7
+} bme280_calib_t;
+
+static bme280_calib_t calib;
+static int32_t t_fine; // Needs to be static global now
+
+void BME280_Init(void) {
+  uint8_t buffer[26];
+
+  // --- 1. Load T/P Calibration (0x88 - 0x9F) ---
+  I2C_Read(BME280_ADDR, 0x88, buffer, 24);
+  // ... [Parse T1-T3, P1-P9 as before] ...
+  calib.dig_T1 = (uint16_t)((buffer[1] << 8) | buffer[0]);
+  calib.dig_T2 = (int16_t)((buffer[3] << 8) | buffer[2]);
+  calib.dig_T3 = (int16_t)((buffer[5] << 8) | buffer[4]);
+  calib.dig_P1 = (uint16_t)((buffer[7] << 8) | buffer[6]);
+  calib.dig_P2 = (int16_t)((buffer[9] << 8) | buffer[8]);
+  calib.dig_P3 = (int16_t)((buffer[11]<< 8) | buffer[10]);
+  calib.dig_P4 = (int16_t)((buffer[13]<< 8) | buffer[12]);
+  calib.dig_P5 = (int16_t)((buffer[15]<< 8) | buffer[14]);
+  calib.dig_P6 = (int16_t)((buffer[17]<< 8) | buffer[16]);
+  calib.dig_P7 = (int16_t)((buffer[19]<< 8) | buffer[18]);
+  calib.dig_P8 = (int16_t)((buffer[21]<< 8) | buffer[20]);
+  calib.dig_P9 = (int16_t)((buffer[23]<< 8) | buffer[22]);
+
+  // --- 2. Load Humidity Calibration (Fragmented) ---
+  // H1 is alone at 0xA1
+  I2C_Read(BME280_ADDR, 0xA1, &calib.dig_H1, 1);
+
+  // H2-H6 are at 0xE1 to 0xE7 (7 bytes)
+  uint8_t h_buff[7];
+  I2C_Read(BME280_ADDR, 0xE1, h_buff, 7);
+
+  calib.dig_H2 = (int16_t)((h_buff[1] << 8) | h_buff[0]); // 0xE1-E2
+  calib.dig_H3 = h_buff[2];                               // 0xE3
+
+  // H4 is 0xE4 (MSB) + 0xE5 (lower 4 bits)
+  // FIX: Cast MSB to (int8_t) first to enforce sign extension
+  calib.dig_H4 = (int16_t)((((int8_t)h_buff[3]) << 4) | (h_buff[4] & 0x0F));
+
+  // H5 is 0xE6 (MSB) + 0xE5 (upper 4 bits)
+  // FIX: Cast MSB to (int8_t) first
+  calib.dig_H5 = (int16_t)((((int8_t)h_buff[5]) << 4) | (h_buff[4] >> 4));
+
+  calib.dig_H6 = (int8_t)h_buff[6]; // 0xE7 (Signed char)
+
+  // --- 3. Configure (Strict Order) ---
+
+  // Step A: Set Humidity Oversampling (x1) to Reg 0xF2
+  uint8_t ctrl_hum[] = { 0xF2, 0x01 };
+  I2C_Write(BME280_ADDR, ctrl_hum, 2);
+
+  // Step B: Set Temp/Press Oversampling + Mode to Reg 0xF4
+  // Note: Writing this register activates the changes in ctrl_hum
+  uint8_t ctrl_meas[] = { 0xF4, 0x27 }; // Normal Mode, x1 Temp, x1 Press
+  I2C_Write(BME280_ADDR, ctrl_meas, 2);
+
+  // Step C: Config (Standby 1000ms)
+  uint8_t config[] = { 0xF5, 0xA0 };
+  I2C_Write(BME280_ADDR, config, 2);
+}
+
+void BME280_Sleep(void) {
+  // Register 0xF4 (ctrl_meas)
+  // Mode 00 = Sleep
+  // We write 0x00 to turn off Oversampling and Mode
+  uint8_t data[] = { 0xF4, 0x00 };
+  I2C_Write(BME280_ADDR, data, 2);
+}
+
+void BME280_Wake(void) {
+  // We do NOT need to reload calibration.
+  // Just restore the config to run a measurement.
+  // Reg 0xF4: x1 Temp (001), x1 Press (001), Normal Mode (11) -> 0x27
+  // Or Forced Mode (01) -> 0x25
+  uint8_t data[] = { 0xF4, 0x27 };
+  I2C_Write(BME280_ADDR, data, 2);
+}
+
+int16_t BME280_ReadTemp(void) {
+  uint8_t buffer[3];
+  int32_t adc_T, var1, var2, T;
+
+  // 1. Read Raw ADC (FA, FB, FC)
+  I2C_Read(BME280_ADDR, BME280_REG_TEMP, buffer, 3);
+
+  // 2. Combine bytes (20-bit resolution)
+  // MSB << 12 | LSB << 4 | XLSB >> 4
+  adc_T = ((int32_t)buffer[0] << 12) | ((int32_t)buffer[1] << 4) | ((int32_t)buffer[2] >> 4);
+
+  // 3. Compensation Formula (Source: Bosch Datasheet)
+  // This math is unavoidable. It maps the raw ADC to actual voltage/temp curves.
+
+  var1 = ((((adc_T >> 3) - ((int32_t)calib.dig_T1 << 1))) * ((int32_t)calib.dig_T2)) >> 11;
+
+  var2 = (((((adc_T >> 4) - ((int32_t)calib.dig_T1)) *
+	    ((adc_T >> 4) - ((int32_t)calib.dig_T1))) >> 12) *
+	  ((int32_t)calib.dig_T3)) >> 14;
+
+  t_fine = var1 + var2; // t_fine carries the fine resolution temp for Pressure calc
+
+  T = (t_fine * 5 + SSD1306_WIDTH) >> 8;
+
+  return (int16_t)T; // Returns temperature in degC * 100
+}
+
+uint32_t BME280_ReadPressure(void) {
+  uint8_t buffer[3];
+  int32_t adc_P, var1, var2;
+  uint32_t p;
+
+  // 1. Read Raw Pressure (F7, F8, F9)
+  I2C_Read(BME280_ADDR, BME280_REG_PRESS, buffer, 3);
+
+  adc_P = ((int32_t)buffer[0] << 12) | ((int32_t)buffer[1] << 4) | ((int32_t)buffer[2] >> 4);
+
+  // 2. Compensation (Bosch 32-bit formula)
+  var1 = (((int32_t)t_fine) >> 1) - (int32_t)64000;
+
+  var2 = (((var1 >> 2) * (var1 >> 2)) >> 11 ) * ((int32_t)calib.dig_P6);
+  var2 = var2 + ((var1 * ((int32_t)calib.dig_P5)) << 1);
+  var2 = (var2 >> 2) + (((int32_t)calib.dig_P4) << 16);
+
+  var1 = (((calib.dig_P3 * (((var1 >> 2) * (var1 >> 2)) >> 13 )) >> 3) +
+	  ((((int32_t)calib.dig_P2) * var1) >> 1)) >> 18;
+
+  var1 = ((((32768 + var1)) * ((int32_t)calib.dig_P1)) >> 15);
+
+  // Division by zero protection (if P1 is empty/error)
+  if (var1 == 0) {
+    return 0;
+  }
+
+  p = (((uint32_t)(((int32_t)1048576) - adc_P) - (var2 >> 12))) * 3125;
+
+  if (p < 0x80000000) {
+    p = (p << 1) / ((uint32_t)var1);
+  } else {
+    p = (p / (uint32_t)var1) * 2;
+  }
+
+  var1 = (((int32_t)calib.dig_P9) * ((int32_t)(((p >> 3) * (p >> 3)) >> 13))) >> 12;
+  var2 = (((int32_t)(p >> 2)) * ((int32_t)calib.dig_P8)) >> 13;
+
+  p = (uint32_t)((int32_t)p + ((var1 + var2 + calib.dig_P7) >> 4));
+
+  return p; // Returns Pressure in Pascals (e.g., 100000)
+}
+
+uint16_t BME280_ReadHumidity(void) {
+  uint8_t buffer[2];
+  int32_t adc_H;
+  int32_t v_x1_u32r;
+
+  // 1. Read Raw Humidity
+  I2C_Read(BME280_ADDR, BME280_REG_HUM_MSB, buffer, 2);
+  adc_H = ((int32_t)buffer[0] << 8) | ((int32_t)buffer[1]);
+
+  // 2. Compensation (Bosch Formula)
+  v_x1_u32r = (t_fine - ((int32_t)76800));
+
+  v_x1_u32r = (((((adc_H << 14) - (((int32_t)calib.dig_H4) << 20) -
+		  (((int32_t)calib.dig_H5) * v_x1_u32r)) + ((int32_t)16384)) >> 15) *
+	       (((((((v_x1_u32r * ((int32_t)calib.dig_H6)) >> 10) *
+		    (((v_x1_u32r * ((int32_t)calib.dig_H3)) >> 11) + ((int32_t)32768))) >> 10) +
+		  ((int32_t)2097152)) * ((int32_t)calib.dig_H2) + 8192) >> 14));
+
+  v_x1_u32r = (v_x1_u32r - (((((v_x1_u32r >> 15) * (v_x1_u32r >> 15)) >> 7) *
+			     ((int32_t)calib.dig_H1)) >> 4));
+
+  // Clamp to 0..100% range in standard Q22 format
+  if (v_x1_u32r < 0) v_x1_u32r = 0;
+  if (v_x1_u32r > 419430400) v_x1_u32r = 419430400;
+
+  // 3. SCALING: Convert Q22.10 (1024=1%) to Centi-percent (100=1%)
+  // Logic: (Value >> 12) gets us the 1024-scale.
+  // Multiply by 25 and divide by 256 (>>8) converts 1024 -> 100.
+
+  uint32_t raw_1024 = (uint32_t)(v_x1_u32r >> 12);
+  uint32_t final_h = (raw_1024 * 25) >> 8;
+
+  return (uint16_t)final_h; // Returns 0 to 10000
 }
 
 /* =========================================================================
@@ -1709,585 +2288,6 @@ void OLED_print_big(uint8_t page, uint8_t col, const char* str) {
         col += 2; // big glyph is 2 chars wide
         str++;
     }
-}
-
-/*
- * =========================================================================================
- * QMC5883P MAGNETOMETER SUBSYSTEM
- * =========================================================================================
- *
- * 1. DEVICE OVERVIEW
- * -----------------------------------------------------------------------------------------
- * - Part Number: QST QMC5883P (Note: 'P' variant is distinct from 'L')
- * - I2C Address: 0x2C (7-bit)
- * - Datasheet:   Rev C (13-52-19)
- *
- * 2. POWER MANAGEMENT STRATEGY (SINGLE SHOT)
- * -----------------------------------------------------------------------------------------
- * To maximize battery life on a CR2032, this driver avoids "Continuous Mode".
- * We utilize the hardware's native "Single Mode" (Forced Mode).
- *
- * - IDLE:   The sensor sits in SUSPEND mode (~3uA current).
- * - ACTIVE: The driver writes 'MODE_SINGLE' to Control Register 1.
- * - ACTION: The sensor Wakes -> Measures -> Updates Data -> Auto-Suspends.
- *
- * This provides a fail-safe mechanism: if the microcontroller hangs or crashes,
- * the sensor will not drain the battery because it automatically returns to sleep.
- *
- * 3. STARTUP DEGAUSSING (HARD IRON / DOMAIN ALIGNMENT)
- * -----------------------------------------------------------------------------------------
- * Upon initialization, the driver performs a specific "Set/Reset" sequence.
- * By forcing a "Set Only" pulse followed by restoring normal "Set/Reset", we generate
- * a strong magnetic field internally. This re-aligns the magnetic domains of the
- * Permalloy film, canceling out offsets caused by nearby magnetic components (speaker).
- *
- * 4. REGISTER MAPPING (0x2C Variant)
- * -----------------------------------------------------------------------------------------
- * 0x00: Chip ID
- * 0x01-0x06: Data Output (X, Y, Z)
- * 0x09: Status Register
- * 0x0A: Control Register 1 (Mode, ODR, OSR, OSR2)
- * 0x0B: Control Register 2 (Soft Reset, Rollover, Interrupt)
- * =========================================================================================
- */
-
-// I2C Address
-#define QMC5883P_I2C_ADDR            0x2c
-
-/* =========================================================================
- *                        REGISTER & ENUM DEFINITIONS
- * ========================================================================= */
-
-/**
- * @brief Register Map (Datasheet Page 14)
- * Note: QMC5883P Control registers are at 0x0A/0x0B (shifted vs QMC5883L)
- */
-typedef enum {
-    QMC5883P_REG_CHIPID   = 0x00, // Chip ID register
-    QMC5883P_REG_X_LSB    = 0x01, // X-axis output LSB register
-    QMC5883P_REG_X_MSB    = 0x02, // X-axis output MSB register
-    QMC5883P_REG_Y_LSB    = 0x03, // Y-axis output LSB register
-    QMC5883P_REG_Y_MSB    = 0x04, // Y-axis output MSB register
-    QMC5883P_REG_Z_LSB    = 0x05, // Z-axis output LSB register
-    QMC5883P_REG_Z_MSB    = 0x06, // Z-axis output MSB register
-    QMC5883P_REG_STATUS   = 0x09, // Status register
-    QMC5883P_REG_CONTROL1 = 0x0A, // Control register 1 (Mode/ODR/OSR)
-    QMC5883P_REG_CONTROL2 = 0x0B, // Control register 2 (Reset/Config)
-} QMC5883P_register_t;
-
-/**
- * @brief Status Register Bits (0x09)
- */
-typedef enum {
-    QMC5883P_STATUS_DRDY = (1 << 0), // Data Ready
-    QMC5883P_STATUS_OVFL = (1 << 1), // Overflow
-} QMC5883P_mode_t;
-
-/**
- * @brief Control register 1
- */
-typedef enum {
-    // Operating Mode (Bits 1:0)
-    QMC5883P_MODE_SUSPEND    = 0, // Suspend mode (Low Power, <3uA)
-    QMC5883P_MODE_NORMAL     = 1, // Normal mode (Old term)
-    QMC5883P_MODE_SINGLE     = 2, // Single Measurement (Auto-Sleep)
-    QMC5883P_MODE_CONTINUOUS = 3, // Continuous Read Mode
-
-    // Output Data Rate (Bits 3:2)
-    // In Single Mode, this determines the speed of the one-shot measurement.
-    QMC5883P_ODR_10HZ  = (0 << 2), // 10 Hz output data rate
-    QMC5883P_ODR_50HZ  = (1 << 2), // 50 Hz output data rate
-    QMC5883P_ODR_100HZ = (2 << 2), // 100 Hz output data rate
-    QMC5883P_ODR_200HZ = (3 << 2), // 200 Hz output data rate (Fastest)
-
-    // Over Sample Ratio 1 (Bits 5:4)
-    // Controls bandwidth/noise. Higher OSR = Lower Noise, Higher Current.
-    QMC5883P_OSR_8 = (0 << 4), // OSR = 8 (Best Filtering)
-    QMC5883P_OSR_4 = (1 << 4), // OSR = 4
-    QMC5883P_OSR_2 = (2 << 4), // OSR = 2
-    QMC5883P_OSR_1 = (3 << 4), // OSR = 1 (Lowest Power)
-
-    // Over Sample Ratio 2 / Downsample (Bits 7:6)
-    // Secondary internal filter setting.
-    QMC5883P_OSR2_1 = (0 << 6), // Downsample ratio = 1
-    QMC5883P_OSR2_2 = (1 << 6), // Downsample ratio = 2
-    QMC5883P_OSR2_4 = (2 << 6), // Downsample ratio = 4
-    QMC5883P_OSR2_8 = (3 << 6), // Downsample ratio = 8
-} QMC5883P_control1_t;
-
-/**
- * @brief Control register 2
- */
-typedef enum {
-    // Set/Reset Logic (Bits 1:0)
-    // Used for the Degaussing / Domain Alignment sequence.
-    QMC5883P_SETRESET_ON      = 0, // Normal: Set and Reset Pulse On
-    QMC5883P_SETRESET_SETONLY = 1, // Pulse: Set Only (Force logic)
-    QMC5883P_SETRESET_OFF     = 2, // Off: Set and Reset Off
-
-    // Field Range (Bits 3:2)
-	QMC5883P_RANGE_30G = (0 << 2), // +/- 30 Gauss range
-	QMC5883P_RANGE_12G = (1 << 2), // +/- 12 Gauss range
-	QMC5883P_RANGE_8G  = (2 << 2), // +/- 8 Gauss range (Balanced)
-	QMC5883P_RANGE_2G  = (3 << 2), // +/- 2 Gauss range (High Sensitivity)
-
-    // Self test
-    QMC5883P_SELF_TEST  = (1 << 6), // Self test
-    QMC5883P_SOFT_RESET = (1 << 7), // Soft Reset (Reboots chip logic)
-} QMC5883P_control2_t;
-
-/**
- * @brief Sensor sensitivity LSB/G
- */
-enum {
-    QMC5883P_SENSITIVITY_2G  = 15000,
-    QMC5883P_SENSITIVITY_8G  = 3750,
-    QMC5883P_SENSITIVITY_12G = 2500,
-    QMC5883P_SENSITIVITY_30G = 1000,
-};
-
-enum {
-    QMC5883P_CONFIG_CONTROL1 = QMC5883P_OSR_8 |   // Lower current moderate noise filtering
-			       QMC5883P_OSR2_8 |  // Light secondary downsampling
-			       QMC5883P_ODR_50HZ, // 50 Hz is visually smooth enough
-
-    QMC5883P_CONFIG_CONTROL2 = QMC5883P_RANGE_8G, // ±8 Gauss range (balanced)
-
-    QMC5883P_CONFIG_SENSITIVITY = QMC5883P_SENSITIVITY_8G // 3750 LSB/G
-};
-
-/* =========================================================================
- *                            DATA STRUCTURES
- * ========================================================================= */
-
-/**
- * @brief Container for the 3-axis magnetic data.
- *        units are in milli Gauss
- */
-struct QMC5883P_data {
-    int16_t x;
-    int16_t y;
-    int16_t z;
-} ;
-
-/* =========================================================================
- *                           PRIVATE FUNCTIONS
- * ========================================================================= */
-
-/**
- * @brief  Writes a byte to a specific register on the QMC5883P.
- * @details Wrapper for the I2C Write transaction.
- * @param  reg   Register Address.
- * @param  data  Value to write.
- */
-void QMC5883P_cmd(uint8_t reg, uint8_t data) {
-  uint8_t buffer[2];
-
-  buffer[0] = reg;
-  buffer[1] = data;
-  // Uses the I2C subsystem to safely handle Start/Stop/Ack
-  I2C_Write(QMC5883P_I2C_ADDR, buffer, 2);
-}
-
-/* =========================================================================
- *                           PUBLIC API FUNCTIONS
- * ========================================================================= */
-
-/**
- * @brief Initializes the QMC5883P sensor for continuous measurement mode.
- * @details
- * 1. Performs Soft Reset to clear stuck states.
- * 2. Runs Degaussing (Set Only -> Set/Reset On) to align magnetic domains.
- * 3. Configuration of output data rate and oversampling.
- * 4. Starts continuous measurement mode.
- *
- * Continuous mode is used during active compass display windows
- * because it provides:
- *  - Stable output
- *  - No repeated suspend transitions
- *  - Reduced risk of internal state-machine lockups
- *
- * @return true if initialization succeeds, false otherwise.
- */
-void QMC5883P_Init(void) {
-  // 1. SOFT RESET
-  // Resets registers to default. Chip enters Suspend Mode automatically.
-  QMC5883P_cmd(QMC5883P_REG_CONTROL2, QMC5883P_SOFT_RESET);
-
-  // Wait for POR (Power On Reset) to complete (~250us per datasheet)
-  _delay_ms(5);
-
-  // 2: Restore "Set/Reset On" logic (Normal Operation)
-  QMC5883P_cmd(QMC5883P_REG_CONTROL2, QMC5883P_CONFIG_CONTROL2);
-
-  // 3. CONFIGURE FILTERS (Control 1)
-  QMC5883P_cmd(QMC5883P_REG_CONTROL1, QMC5883P_CONFIG_CONTROL1 | QMC5883P_MODE_CONTINUOUS);
-  _delay_ms(50);
-}
-
-/**
- * @brief Places the sensor into low-power suspend mode.
- * @details
- * In suspend mode:
- *   - Measurement engine is stopped
- *   - Current consumption drops to a few microamps
- *   - Registers retain configuration
- *
- * This function should be called when:
- *   - Compass display is no longer needed
- *   - System enters long idle period
- *
- * @return true if command succeeds, false otherwise.
- */
-void QMC5883P_sleep(void) {
-  QMC5883P_cmd(QMC5883P_REG_CONTROL1, QMC5883P_MODE_SUSPEND);
-}
-
-/**
- * @brief  Performs a Single-Shot measurement and reads data.
- * @details
- * 1. Wakes sensor by setting MODE_SINGLE.
- * 2. Waits for measurement completion (Fixed delay).
- * 3. Reads Data registers.
- * 4. Sensor automatically returns to SUSPEND mode (Hardware feature).
- *
- * @param[out] pData  Pointer to QMC5883P_data_t structure.
- * @return true if read successful, false if I2C error or device not ready.
- */
-bool QMC5883P_read(struct QMC5883P_data *pData) {
-  if (pData == NULL)
-    return false;
-
-  uint8_t status;
-  uint8_t buffer[7]; // Buffer for ID, X(2), Y(2), Z(2)
-  uint16_t timeout = 10000; // 100 * 100us = 10ms timeout
-
-  // Wait for DRDY
-  if (!I2C_Read(QMC5883P_I2C_ADDR, QMC5883P_REG_STATUS, &status, 1))
-    return false;
-  if (!(status & QMC5883P_STATUS_DRDY))
-    return false;
-
-  // 3. READ DATA REGISTERS
-  // We read 7 bytes starting from 0x00 (REG_CHIPID).
-  // This forces the internal pointer to align correctly,
-  if (!I2C_Read(QMC5883P_I2C_ADDR, QMC5883P_REG_CHIPID, buffer, 7))
-    return false;
-
-  // 4. PARSE DATA
-  // Data is Little Endian (LSB at lower address).
-  // Explicit casting ensures 16-bit reconstruction before signed interpretation.
-  // Order: X_LSB, X_MSB, Y_LSB, Y_MSB, Z_LSB, Z_MSB
-
-  int16_t raw_x = (int16_t) (buffer[1] | ((uint16_t) buffer[2] << 8));
-  int16_t raw_y = (int16_t) (buffer[3] | ((uint16_t) buffer[4] << 8));
-  int16_t raw_z = (int16_t) (buffer[5] | ((uint16_t) buffer[6] << 8));
-
-  // convert units to milli Gauss
-  pData->x = (int32_t) raw_x * 1000 / QMC5883P_CONFIG_SENSITIVITY;
-  pData->y = (int32_t) raw_y * 1000 / QMC5883P_CONFIG_SENSITIVITY;
-  pData->z = (int32_t) raw_z * 1000 / QMC5883P_CONFIG_SENSITIVITY;
-
-  return true;
-}
-
-////////////////////////////
-
-#define BME280_ADDR         0x76 // Check your module: 0x76 (SDO=GND) or 0x77 (SDO=VCC)
-
-// Registers
-#define BME280_REG_DIG_T1   0x88 // Start of Temp Calibration
-#define BME280_REG_ID       0xD0
-#define BME280_REG_CTRL     0xF4 // Control Measurement
-#define BME280_REG_TEMP     0xFA // Temp MSB
-// Add Pressure Registers
-#define BME280_REG_DIG_P1   0x8E
-#define BME280_REG_PRESS    0xF7 // Pressure MSB
-// Add Humidity Registers
-#define BME280_REG_CTRL_HUM 0xF2
-#define BME280_REG_HUM_MSB  0xFD
-
-typedef struct {
-    // Temp (0x88)
-    uint16_t dig_T1;
-    int16_t  dig_T2;
-    int16_t  dig_T3;
-    // Pressure (0x8E)
-    uint16_t dig_P1;
-    int16_t  dig_P2; int16_t  dig_P3; int16_t  dig_P4;
-    int16_t  dig_P5; int16_t  dig_P6; int16_t  dig_P7;
-    int16_t  dig_P8; int16_t  dig_P9;
-
-    // Humidity (Fragmented)
-    uint8_t  dig_H1; // 0xA1
-    int16_t  dig_H2; // 0xE1
-    uint8_t  dig_H3; // 0xE3
-    int16_t  dig_H4; // 0xE4 + 0xE5[3:0]
-    int16_t  dig_H5; // 0xE6 + 0xE5[7:4]
-    int8_t   dig_H6; // 0xE7
-} bme280_calib_t;
-
-static bme280_calib_t calib;
-static int32_t t_fine; // Needs to be static global now
-
-void BME280_Init(void) {
-    uint8_t buffer[26];
-
-    // --- 1. Load T/P Calibration (0x88 - 0x9F) ---
-    I2C_Read(BME280_ADDR, 0x88, buffer, 24);
-    // ... [Parse T1-T3, P1-P9 as before] ...
-    calib.dig_T1 = (uint16_t)((buffer[1] << 8) | buffer[0]);
-    calib.dig_T2 = (int16_t)((buffer[3] << 8) | buffer[2]);
-    calib.dig_T3 = (int16_t)((buffer[5] << 8) | buffer[4]);
-    calib.dig_P1 = (uint16_t)((buffer[7] << 8) | buffer[6]);
-    calib.dig_P2 = (int16_t)((buffer[9] << 8) | buffer[8]);
-    calib.dig_P3 = (int16_t)((buffer[11]<< 8) | buffer[10]);
-    calib.dig_P4 = (int16_t)((buffer[13]<< 8) | buffer[12]);
-    calib.dig_P5 = (int16_t)((buffer[15]<< 8) | buffer[14]);
-    calib.dig_P6 = (int16_t)((buffer[17]<< 8) | buffer[16]);
-    calib.dig_P7 = (int16_t)((buffer[19]<< 8) | buffer[18]);
-    calib.dig_P8 = (int16_t)((buffer[21]<< 8) | buffer[20]);
-    calib.dig_P9 = (int16_t)((buffer[23]<< 8) | buffer[22]);
-
-    // --- 2. Load Humidity Calibration (Fragmented) ---
-    // H1 is alone at 0xA1
-    I2C_Read(BME280_ADDR, 0xA1, &calib.dig_H1, 1);
-
-    // H2-H6 are at 0xE1 to 0xE7 (7 bytes)
-    uint8_t h_buff[7];
-    I2C_Read(BME280_ADDR, 0xE1, h_buff, 7);
-
-    calib.dig_H2 = (int16_t)((h_buff[1] << 8) | h_buff[0]); // 0xE1-E2
-    calib.dig_H3 = h_buff[2];                               // 0xE3
-
-    // H4 is 0xE4 (MSB) + 0xE5 (lower 4 bits)
-    // FIX: Cast MSB to (int8_t) first to enforce sign extension
-    calib.dig_H4 = (int16_t)((((int8_t)h_buff[3]) << 4) | (h_buff[4] & 0x0F));
-
-    // H5 is 0xE6 (MSB) + 0xE5 (upper 4 bits)
-    // FIX: Cast MSB to (int8_t) first
-    calib.dig_H5 = (int16_t)((((int8_t)h_buff[5]) << 4) | (h_buff[4] >> 4));
-
-    calib.dig_H6 = (int8_t)h_buff[6]; // 0xE7 (Signed char)
-
-    // --- 3. Configure (Strict Order) ---
-
-    // Step A: Set Humidity Oversampling (x1) to Reg 0xF2
-    uint8_t ctrl_hum[] = { 0xF2, 0x01 };
-    I2C_Write(BME280_ADDR, ctrl_hum, 2);
-
-    // Step B: Set Temp/Press Oversampling + Mode to Reg 0xF4
-    // Note: Writing this register activates the changes in ctrl_hum
-    uint8_t ctrl_meas[] = { 0xF4, 0x27 }; // Normal Mode, x1 Temp, x1 Press
-    I2C_Write(BME280_ADDR, ctrl_meas, 2);
-
-    // Step C: Config (Standby 1000ms)
-    uint8_t config[] = { 0xF5, 0xA0 };
-    I2C_Write(BME280_ADDR, config, 2);
-}
-
-void BME280_Sleep(void) {
-    // Register 0xF4 (ctrl_meas)
-    // Mode 00 = Sleep
-    // We write 0x00 to turn off Oversampling and Mode
-    uint8_t data[] = { 0xF4, 0x00 };
-    I2C_Write(BME280_ADDR, data, 2);
-}
-
-void BME280_Wake(void) {
-    // We do NOT need to reload calibration.
-    // Just restore the config to run a measurement.
-    // Reg 0xF4: x1 Temp (001), x1 Press (001), Normal Mode (11) -> 0x27
-    // Or Forced Mode (01) -> 0x25
-    uint8_t data[] = { 0xF4, 0x27 };
-    I2C_Write(BME280_ADDR, data, 2);
-}
-
-int16_t BME280_ReadTemp(void) {
-    uint8_t buffer[3];
-    int32_t adc_T, var1, var2, T;
-
-    // 1. Read Raw ADC (FA, FB, FC)
-    I2C_Read(BME280_ADDR, BME280_REG_TEMP, buffer, 3);
-
-    // 2. Combine bytes (20-bit resolution)
-    // MSB << 12 | LSB << 4 | XLSB >> 4
-    adc_T = ((int32_t)buffer[0] << 12) | ((int32_t)buffer[1] << 4) | ((int32_t)buffer[2] >> 4);
-
-    // 3. Compensation Formula (Source: Bosch Datasheet)
-    // This math is unavoidable. It maps the raw ADC to actual voltage/temp curves.
-
-    var1 = ((((adc_T >> 3) - ((int32_t)calib.dig_T1 << 1))) * ((int32_t)calib.dig_T2)) >> 11;
-
-    var2 = (((((adc_T >> 4) - ((int32_t)calib.dig_T1)) *
-          ((adc_T >> 4) - ((int32_t)calib.dig_T1))) >> 12) *
-        ((int32_t)calib.dig_T3)) >> 14;
-
-    t_fine = var1 + var2; // t_fine carries the fine resolution temp for Pressure calc
-
-    T = (t_fine * 5 + SSD1306_WIDTH) >> 8;
-
-    return (int16_t)T; // Returns temperature in degC * 100
-}
-
-uint32_t BME280_ReadPressure(void) {
-    uint8_t buffer[3];
-    int32_t adc_P, var1, var2;
-    uint32_t p;
-
-    // 1. Read Raw Pressure (F7, F8, F9)
-    I2C_Read(BME280_ADDR, BME280_REG_PRESS, buffer, 3);
-
-    adc_P = ((int32_t)buffer[0] << 12) | ((int32_t)buffer[1] << 4) | ((int32_t)buffer[2] >> 4);
-
-    // 2. Compensation (Bosch 32-bit formula)
-    var1 = (((int32_t)t_fine) >> 1) - (int32_t)64000;
-
-    var2 = (((var1 >> 2) * (var1 >> 2)) >> 11 ) * ((int32_t)calib.dig_P6);
-    var2 = var2 + ((var1 * ((int32_t)calib.dig_P5)) << 1);
-    var2 = (var2 >> 2) + (((int32_t)calib.dig_P4) << 16);
-
-    var1 = (((calib.dig_P3 * (((var1 >> 2) * (var1 >> 2)) >> 13 )) >> 3) +
-        ((((int32_t)calib.dig_P2) * var1) >> 1)) >> 18;
-
-    var1 = ((((32768 + var1)) * ((int32_t)calib.dig_P1)) >> 15);
-
-    // Division by zero protection (if P1 is empty/error)
-    if (var1 == 0) {
-        return 0;
-    }
-
-    p = (((uint32_t)(((int32_t)1048576) - adc_P) - (var2 >> 12))) * 3125;
-
-    if (p < 0x80000000) {
-        p = (p << 1) / ((uint32_t)var1);
-    } else {
-        p = (p / (uint32_t)var1) * 2;
-    }
-
-    var1 = (((int32_t)calib.dig_P9) * ((int32_t)(((p >> 3) * (p >> 3)) >> 13))) >> 12;
-    var2 = (((int32_t)(p >> 2)) * ((int32_t)calib.dig_P8)) >> 13;
-
-    p = (uint32_t)((int32_t)p + ((var1 + var2 + calib.dig_P7) >> 4));
-
-    return p; // Returns Pressure in Pascals (e.g., 100000)
-}
-
-uint16_t BME280_ReadHumidity(void) {
-    uint8_t buffer[2];
-    int32_t adc_H;
-    int32_t v_x1_u32r;
-
-    // 1. Read Raw Humidity
-    I2C_Read(BME280_ADDR, BME280_REG_HUM_MSB, buffer, 2);
-    adc_H = ((int32_t)buffer[0] << 8) | ((int32_t)buffer[1]);
-
-    // 2. Compensation (Bosch Formula)
-    v_x1_u32r = (t_fine - ((int32_t)76800));
-
-    v_x1_u32r = (((((adc_H << 14) - (((int32_t)calib.dig_H4) << 20) -
-            (((int32_t)calib.dig_H5) * v_x1_u32r)) + ((int32_t)16384)) >> 15) *
-             (((((((v_x1_u32r * ((int32_t)calib.dig_H6)) >> 10) *
-              (((v_x1_u32r * ((int32_t)calib.dig_H3)) >> 11) + ((int32_t)32768))) >> 10) +
-            ((int32_t)2097152)) * ((int32_t)calib.dig_H2) + 8192) >> 14));
-
-    v_x1_u32r = (v_x1_u32r - (((((v_x1_u32r >> 15) * (v_x1_u32r >> 15)) >> 7) *
-                   ((int32_t)calib.dig_H1)) >> 4));
-
-    // Clamp to 0..100% range in standard Q22 format
-    if (v_x1_u32r < 0) v_x1_u32r = 0;
-    if (v_x1_u32r > 419430400) v_x1_u32r = 419430400;
-
-    // 3. SCALING: Convert Q22.10 (1024=1%) to Centi-percent (100=1%)
-    // Logic: (Value >> 12) gets us the 1024-scale.
-    // Multiply by 25 and divide by 256 (>>8) converts 1024 -> 100.
-
-    uint32_t raw_1024 = (uint32_t)(v_x1_u32r >> 12);
-    uint32_t final_h = (raw_1024 * 25) >> 8;
-
-    return (uint16_t)final_h; // Returns 0 to 10000
-}
-
-/*
- * =============================================================================
- *                    ATTiny85 sleep/standby for low power consumption
- * BATTERY LIFE ESTIMATION (ATtiny85 + SSD1306 + QMC5883P + BME280 + LED)
- * =============================================================================
- *
- * Components:
- *   - ATtiny85 MCU
- *   - SSD1306 OLED
- *   - Status LED
- *   - QMC5883P magnetometer
- *   - BME280 environmental sensor
- *
- * Typical currents at 3V:
- * -----------------------
- * Sleep Mode (power-down, minimal usage):
- *   - ATtiny85: 0.5 µA
- *   - SSD1306: 0 µA (powered down)
- *   - LED: 0 µA (off)
- *   - QMC5883P: 1 µA (shutdown)
- *   - BME280: 0.1 µA (low-power)
- *   -> Total sleep current: I_sleep ≈ 1.6 µA ≈ 0.0016 mA
- *
- * Active Mode (everything running):
- *   - ATtiny85: 5 mA
- *   - SSD1306: 15 mA
- *   - LED: 5 mA
- *   - QMC5883P: 0.1 mA
- *   - BME280: 0.03 mA
- *   -> Total active current: I_active ≈ 25.13 mA
- *
- * Battery: CR2032, typical capacity 225 mAh
- *
- * ============================================================================
- * MAXIMUM BATTERY LIFE (full sleep, everything off except MCU + sensors in low power)
- * ============================================================================
- * I_sleep = 0.0016 mA
- * Battery life ≈ Capacity / Current
- * Battery life ≈ 225 mAh / 0.0016 mA ≈ 140,625 hours
- * Convert to years: 140,625 / 24 / 365 ≈ 16 years (!!)
- * Note: This is theoretical; real-world factors like self-discharge, leakage,
- *       and temperature reduce practical life.
- *
- * ============================================================================
- * MINIMUM BATTERY LIFE (full active, everything running continuously)
- * ============================================================================
- * I_active = 25.13 mA
- * Battery life ≈ 225 mAh / 25.13 mA ≈ 8.95 hours
- *
- * =============================================================================
- */
-
-// Note: On ATtiny85, all pin changes (PCINT0 to PCINT5)
-// trigger the SAME vector: PCINT0_vect.
-ISR(PCINT0_vect) {
-  // This code runs immediately upon wake-up.
-  // You can leave this empty if you just want to wake up.
-}
-
-void go_to_sleep(void) {
-  byte buttonState;
-
-  do {
-    ADCSRA &= ~(1 << ADEN);               // Disable ADC
-    ACSR |= (1 << ACD);                   // Disable analog comparator
-    power_all_disable();                  // Disable all peripherals
-    PCMSK |= (1 << PCINT1);               // Enable PCINT1
-    GIMSK |= (1 << PCIE);                 // Enable pin change interrupts globally
-    set_sleep_mode(SLEEP_MODE_PWR_DOWN);  // lowest power mode
-    sleep_enable();                       // allow sleep
-    sleep_bod_disable();                  // disable brown-out detection
-    sei();                                // ensure interrupts enabled
-    sleep_cpu();                          // MCU sleeps here
-    sleep_disable();                      // resumes here after wake
-    power_all_enable();                   // Re-enable after wake
-    PCMSK &= ~(1 << PCINT1);              // Disable PCINT1
-
-    // probe pin6
-    buttonState = digitalRead(PB1); // wait until  HIGH to LOW
-  } while (buttonState != LOW);
 }
 
 // =================================================================================
