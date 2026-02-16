@@ -136,6 +136,25 @@ static int8_t MATH_cos(int16_t angle) {
   return MATH_sin(angle + 90);
 }
 
+static const uint8_t MATH_atan_LUT[] PROGMEM = {
+  0,  0,  1,  1,  2,  2,  3,  3,
+  4,  4,  5,  5,  5,  6,  6,  7,
+  7,  8,  8,  9,  9,  9, 10, 10,
+  11, 11, 12, 12, 12, 13, 13, 14,
+  14, 15, 15, 15, 16, 16, 17, 17,
+  17, 18, 18, 19, 19, 20, 20, 20,
+  21, 21, 21, 22, 22, 23, 23, 23,
+  24, 24, 25, 25, 25, 26, 26, 26,
+  27, 27, 27, 28, 28, 29, 29, 29,
+  30, 30, 30, 31, 31, 31, 32, 32,
+  32, 33, 33, 33, 33, 34, 34, 34,
+  35, 35, 35, 36, 36, 36, 37, 37,
+  37, 37, 38, 38, 38, 38, 39, 39,
+  39, 40, 40, 40, 40, 41, 41, 41,
+  41, 42, 42, 42, 42, 43, 43, 43,
+  43, 44, 44, 44, 44, 45, 45, 45,
+};
+
 /**
  * @brief  Computes approximate angle in degrees (0-359).
  *
@@ -182,7 +201,15 @@ uint16_t MATH_atan2(int16_t y, int16_t x) {
   // 5. Calculate Octant Angle (0-45 degrees)
   // Formula: angle = slope * 45
   // Note: If mx is 0 (should be impossible handled by step 1), result is 0.
+#if 0
+  // linear
   uint16_t angle = (mn * 45) / mx;
+#else
+  // curve
+  uint16_t index = ((uint32_t) mn << 7) / mx;
+  if (index > 127) index = 127;
+  uint16_t angle = (uint8_t) pgm_read_byte(&MATH_atan_LUT[index]);
+#endif
 
   // 6. Map Octant to Circle (0-360)
   if (x >= 0) {
@@ -193,7 +220,7 @@ uint16_t MATH_atan2(int16_t y, int16_t x) {
     } else {
       // Quadrant 4 (x+, y-)
       if (ax < ay) return 270 + angle;    // 315-360
-      else if (angle == 0) return 0;
+      else if (angle == 0) return 0;      // full circle
       else return 360 - angle;            // 270-315
     }
   } else {
@@ -334,7 +361,7 @@ uint16_t MATH_atan2(int16_t y, int16_t x) {
  *          Since it is `static inline`, the compiler will replace calls with
  *          the actual delay code, avoiding function call overhead.
  */
-static inline void I2C_delay(void) {
+static inline void I2C_delay() {
   _delay_us(I2C_DELAY_HALF_CYCLE_US);
 }
 
@@ -345,7 +372,7 @@ static inline void I2C_delay(void) {
  * - LOGICAL:  Sets Data Direction Register (DDR) bit to 1.
  *             Sets PORT register bit to 0.
  */
-static inline void I2C_sda_low(void) {
+static inline void I2C_sda_low() {
   // Set bit in DDR to make it Output
   I2C_DDR_REG  = (uint8_t)(I2C_DDR_REG | MASK_SDA);
   // Clear bit in PORT to drive Low
@@ -360,7 +387,7 @@ static inline void I2C_sda_low(void) {
  * - LOGICAL:  Sets Data Direction Register (DDR) bit to 0.
  *             CRITICAL: Sets PORT bit to 0 to DISABLE internal MCU pull-up.
  */
-static inline void I2C_sda_high(void) {
+static inline void I2C_sda_high() {
   // Clear bit in DDR to make it Input (High Impedance)
   I2C_DDR_REG  = (uint8_t)(I2C_DDR_REG & (uint8_t)(~MASK_SDA));
   // Clear bit in PORT to DISABLE internal pull-up
@@ -371,7 +398,7 @@ static inline void I2C_sda_high(void) {
  * @brief  Drives the SCL line to Logic 0 (LOW).
  * @details Sets DDR to Output, PORT to Low.
  */
-static inline void I2C_scl_low(void) {
+static inline void I2C_scl_low() {
   // Set bit in DDR to make it Output
   I2C_DDR_REG  = (uint8_t)(I2C_DDR_REG | MASK_SCL);
   // Clear bit in PORT to drive Low
@@ -382,7 +409,7 @@ static inline void I2C_scl_low(void) {
  * @brief  Releases the SCL line to Logic 1 (HIGH-Z).
  * @details Sets DDR to Input, PORT to Low (Disable internal pull-up).
  */
-static inline void I2C_scl_high(void) {
+static inline void I2C_scl_high() {
   // Clear bit in DDR to make it Input (High Impedance)
   I2C_DDR_REG  = (uint8_t)(I2C_DDR_REG & (uint8_t)(~MASK_SCL));
   // Clear bit in PORT to DISABLE internal pull-up
@@ -393,7 +420,7 @@ static inline void I2C_scl_high(void) {
  * @brief  Reads the current logic state of the SDA line.
  * @return true if Voltage > V_threshold (Logic 1), false otherwise.
  */
-static inline bool I2C_sda_sense(void) {
+static inline bool I2C_sda_sense() {
   return ((I2C_PIN_REG & MASK_SDA) != 0);
 }
 
@@ -559,7 +586,7 @@ static bool I2C_start(uint8_t dev_addr, bool read_mode) {
  * PROTOCOL: SDA transitions Low->High while SCL is High.
  * This signals the end of the transaction and releases the bus to IDLE.
  */
-static void I2C_stop(void) {
+static void I2C_stop() {
   I2C_sda_low(); // Ensure SDA is Low first
   I2C_delay();
 
@@ -582,7 +609,7 @@ static void I2C_stop(void) {
  * We toggle SCL 9 times to force the Target to shift out the remaining bits
  * and see a NACK/STOP.
  */
-void I2C_recover_bus(void) {
+void I2C_recover_bus() {
   // 1. Release lines to check state
   I2C_sda_high();
   I2C_scl_high();
@@ -609,7 +636,7 @@ void I2C_recover_bus(void) {
  * 2. Sets SDA/SCL to Input (High-Z).
  * 3. Disables internal MCU pull-ups.
  */
-void I2C_init(void) {
+void I2C_init() {
   I2C_recover_bus();
 
   // Set Idle State
@@ -799,7 +826,7 @@ bool I2C_write(uint8_t dev_addr, const uint8_t *p_data, uint8_t length) {
  * @brief  Measures the Power Supply Voltage (VCC).
  * @return uint16_t Voltage in millivolts (e.g., 3005 = 3.005V).
  */
-uint16_t ADC_get_voltage(void) {
+uint16_t ADC_get_voltage() {
   uint16_t adc_val;
   uint32_t vcc_calc;
 
@@ -945,7 +972,7 @@ ISR(PCINT0_vect) {
   // You can leave this empty if you just want to wake up.
 }
 
-void PWR_power_down(void) {
+void PWR_power_down() {
   byte buttonState;
 
   do {
@@ -1074,7 +1101,7 @@ static const uint8_t SSD1306_init_data[] PROGMEM = {
 /**
  * @brief  Sends a single byte command to the OLED.
  * @details Wraps I2C Start/Write/Stop.
- * @param  c  Command byte.
+ * @param  cmd  Command byte.
  */
 static void SSD1306_cmd(uint8_t cmd) {
   uint8_t buffer[2];
@@ -1089,7 +1116,7 @@ static void SSD1306_cmd(uint8_t cmd) {
  * @brief  Initializes the SSD1306 OLED.
  * @details Sends the initialization command sequence defined in INIT_SEQ.
  */
-void SSD1306_init(void) {
+void SSD1306_init() {
   // Send init sequence byte-by-byte
   // Optimization: Could stream this, but init is done once.
   for (uint8_t i = 0; i < sizeof(SSD1306_init_data); i++)
@@ -1099,14 +1126,14 @@ void SSD1306_init(void) {
 /**
  * @brief  Puts the OLED into deep sleep (< 10µA).
  */
-void SSD1306_sleep(void) {
+void SSD1306_sleep() {
   SSD1306_cmd(SSD1306_CMD_DISPLAY_OFF);
 }
 
 /**
  * @brief  Wakes the OLED from sleep (GDDRAM is retained!)
  */
-void SSD1306_wake(void) {
+void SSD1306_wake() {
   SSD1306_cmd(SSD1306_CMD_DISPLAY_ON); // Display ON
 }
 
@@ -1137,7 +1164,7 @@ void SSD1306_set_cursor(uint8_t page, uint8_t col) {
  * @brief  Clears the entire display buffer.
  * @details Writes 0x00 to all pages/columns.
  */
-void SSD1306_clear(void) {
+void SSD1306_clear() {
   for (uint8_t page = 0; page < SSD1306_HEIGHT / 8; page++) {
     SSD1306_set_cursor(page, 0);
 
@@ -1292,9 +1319,9 @@ enum {
                              QMC5883P_OSR2_8 |  // Light secondary downsampling
                              QMC5883P_ODR_50HZ, // 50 Hz is visually smooth enough
 
-  QMC5883P_CONFIG_CONTROL2 = QMC5883P_RANGE_8G, // ±8 Gauss range (balanced)
+  QMC5883P_CONFIG_CONTROL2 = QMC5883P_RANGE_2G, // ±8 Gauss range (balanced)
 
-  QMC5883P_CONFIG_SENSITIVITY = QMC5883P_SENSITIVITY_8G // 3750 LSB/G
+  QMC5883P_CONFIG_SENSITIVITY = QMC5883P_SENSITIVITY_2G // 15000 LSB/G
 };
 
 /* =========================================================================
@@ -1304,11 +1331,15 @@ enum {
 /**
  * @brief Container for the 3-axis magnetic data.
  *        units are in milli Gauss
+ *
+ * @date 2026-02-15 23:10:07
+ *   Calculate the angle with raw sensor values as they are larger and more stable
  */
 struct QMC5883P_data {
   int16_t x;
   int16_t y;
   int16_t z;
+  uint16_t heading;
 };
 
 /* =========================================================================
@@ -1350,20 +1381,27 @@ void QMC5883P_cmd(uint8_t reg, uint8_t data) {
  *
  * @return true if initialization succeeds, false otherwise.
  */
-void QMC5883P_init(void) {
-  // 1. SOFT RESET
+void QMC5883P_init() {
+  // SOFT RESET
   // Resets registers to default. Chip enters Suspend Mode automatically.
   QMC5883P_cmd(QMC5883P_REG_CONTROL2, QMC5883P_SOFT_RESET);
 
   // Wait for POR (Power On Reset) to complete (~250us per datasheet)
-  _delay_ms(5);
+  _delay_ms(20);
 
-  // 2: Restore "Set/Reset On" logic (Normal Operation)
+  /*
+   * @date 2026-02-16 01:59:24
+   * Take the chip out of the suspend mode before writing control2,
+   *   this is not clear from the data sheet
+   */
+  QMC5883P_cmd(QMC5883P_REG_CONTROL2, QMC5883P_CONFIG_CONTROL2);
+  QMC5883P_cmd(QMC5883P_REG_CONTROL1, QMC5883P_CONFIG_CONTROL1 | QMC5883P_MODE_CONTINUOUS);
+
+  // SET SENSITIVITY
   QMC5883P_cmd(QMC5883P_REG_CONTROL2, QMC5883P_CONFIG_CONTROL2);
 
-  // 3. CONFIGURE FILTERS (Control 1)
+  // CONFIGURE AGAIN
   QMC5883P_cmd(QMC5883P_REG_CONTROL1, QMC5883P_CONFIG_CONTROL1 | QMC5883P_MODE_CONTINUOUS);
-  _delay_ms(50);
 }
 
 /**
@@ -1380,7 +1418,7 @@ void QMC5883P_init(void) {
  *
  * @return true if command succeeds, false otherwise.
  */
-void QMC5883P_sleep(void) {
+void QMC5883P_sleep() {
   QMC5883P_cmd(QMC5883P_REG_CONTROL1, QMC5883P_MODE_SUSPEND);
 }
 
@@ -1392,6 +1430,9 @@ void QMC5883P_sleep(void) {
  * 3. Reads Data registers.
  * 4. Sensor automatically returns to SUSPEND mode (Hardware feature).
  *
+ * @date 2026-02-15 23:27:05
+ *   read 7 bytes from register 0 to avoid possible register sync issues
+ *
  * @param[out] pData  Pointer to QMC5883P_data_t structure.
  * @return true if read successful, false if I2C error or device not ready.
  */
@@ -1401,7 +1442,6 @@ bool QMC5883P_read(struct QMC5883P_data *pData) {
 
   uint8_t status;
   uint8_t buffer[7]; // Buffer for ID, X(2), Y(2), Z(2)
-  uint16_t timeout = 10000; // 100 * 100us = 10ms timeout
 
   // Wait for DRDY
   if (!I2C_read(QMC5883P_I2C_ADDR, QMC5883P_REG_STATUS, &status, 1))
@@ -1428,6 +1468,9 @@ bool QMC5883P_read(struct QMC5883P_data *pData) {
   pData->x = (int32_t) raw_x * 1000 / QMC5883P_CONFIG_SENSITIVITY;
   pData->y = (int32_t) raw_y * 1000 / QMC5883P_CONFIG_SENSITIVITY;
   pData->z = (int32_t) raw_z * 1000 / QMC5883P_CONFIG_SENSITIVITY;
+
+  // calculate heading on raw values as the are larger and more stable.
+  pData->heading = MATH_atan2(raw_y, raw_x);
 
   return true;
 }
@@ -1471,7 +1514,7 @@ typedef struct {
 static BME280_calib_t calib;
 static int32_t t_fine; // Needs to be static global now
 
-void BME280_init(void) {
+void BME280_init() {
   uint8_t buffer[26];
 
   // --- 1. Load T/P Calibration (0x88 - 0x9F) ---
@@ -1527,7 +1570,7 @@ void BME280_init(void) {
   I2C_write(BME280_ADDR, config, 2);
 }
 
-void BME280_sleep(void) {
+void BME280_sleep() {
   // Register 0xF4 (ctrl_meas)
   // Mode 00 = Sleep
   // We write 0x00 to turn off Oversampling and Mode
@@ -1535,7 +1578,7 @@ void BME280_sleep(void) {
   I2C_write(BME280_ADDR, data, 2);
 }
 
-void BME280_wake(void) {
+void BME280_wake() {
   // We do NOT need to reload calibration.
   // Just restore the config to run a measurement.
   // Reg 0xF4: x1 Temp (001), x1 Press (001), Normal Mode (11) -> 0x27
@@ -1544,7 +1587,7 @@ void BME280_wake(void) {
   I2C_write(BME280_ADDR, data, 2);
 }
 
-int16_t BME280_read_temp(void) {
+int16_t BME280_read_temp() {
   uint8_t buffer[3];
   int32_t adc_T, var1, var2, T;
 
@@ -1571,7 +1614,7 @@ int16_t BME280_read_temp(void) {
   return (int16_t)T; // Returns temperature in degC * 100
 }
 
-uint32_t BME280_read_pressure(void) {
+uint32_t BME280_read_pressure() {
   uint8_t buffer[3];
   int32_t adc_P, var1, var2;
   uint32_t p;
@@ -1614,7 +1657,7 @@ uint32_t BME280_read_pressure(void) {
   return p; // Returns Pressure in Pascals (e.g., 100000)
 }
 
-uint16_t BME280_read_humidity(void) {
+uint16_t BME280_read_humidity() {
   uint8_t buffer[2];
   int32_t adc_H;
   int32_t v_x1_u32r;
@@ -1772,7 +1815,7 @@ const uint8_t OLED_needle_data[] PROGMEM = {
 void OLED_draw_compass(uint8_t page0, uint8_t col0, int16_t angle) {
   // --- 2. TRIGONOMETRY (Q8.8 Base) ---
   // Fetch Sine/Cosine (Result -127 to +127)
-  const int8_t isin = MATH_sin(angle);
+  const int8_t isin = -MATH_sin(angle);
   const int8_t icos = MATH_cos(angle);
 
   // sinInt returns +/- 127. Shift << 1 makes it +/- 254 (approx 256 or 1.0).
@@ -2169,7 +2212,7 @@ void OLED_sprint_uint(char *str, uint16_t num, int8_t width = 0) {
     *str++ = '0' + (uint8_t) num;
 
     // 4. Terminate string
-    *str++ = 0;
+    *str = 0;
 }
 
 /**
@@ -2431,7 +2474,7 @@ ISR(TIMER1_COMPA_vect) {
   }
 }
 
-void sonic_Init(void) {
+void sonic_Init() {
   cli();
 
   /* --- GPIO setup --- */
@@ -2497,7 +2540,7 @@ void sonic_tone(uint16_t freq) {
   sei();
 }
 
-void sonic_noInt(void) {
+void sonic_noInt() {
   cli();
 
   /* --- Disable interrupt first --- */
@@ -2639,7 +2682,7 @@ volatile uint8_t ledPwmPhase = 0;
  * @brief  Initializes the LED subsystem without disturbing Timer0's millis() settings.
  * @return void
  */
-void led_init(void) {
+void led_init() {
   // 2. Set default State: HIGH (LED OFF for Active Low)
   // Since the LED is wired Active Low (VCC -> Resistor -> LED -> Pin),
   //    setting the pin HIGH turns the LED OFF.
@@ -2658,7 +2701,7 @@ void led_init(void) {
 /**
  * Disable led interrupts
  */
-void led_noInt(void) {
+void led_noInt() {
   cli();  // Disable global interrupts
 
   /* --- Disable COMPB interrupt --- */
@@ -2843,10 +2886,9 @@ Notes / Safety:
  * Interleave to give sound updates more chance.
  *
  */
-void update_ui(void) {
+void update_ui() {
   static int interleave = 0;
   static struct QMC5883P_data qmc_data;
-  static int16_t heading_deg;
 
   switch (interleave) {
     case 0:
@@ -2854,6 +2896,13 @@ void update_ui(void) {
         interleave = 5;
         return;
       }
+
+      /*
+       * @date 2026-02-16 02:16:23
+       * For this device the compass is upside down
+       */
+      qmc_data.heading = 359 - qmc_data.heading;
+
       OLED_set_cursor(0, 14);
       OLED_string("X");
       OLED_print_int(qmc_data.x, 4);
@@ -2875,16 +2924,15 @@ void update_ui(void) {
       interleave++;
       return;
     case 3: {
-      heading_deg = MATH_atan2(qmc_data.y, qmc_data.x);
       char strbuf[10];
-      OLED_sprint_uint(strbuf, heading_deg, 3);
+      OLED_sprint_uint(strbuf, qmc_data.heading, 3);
       OLED_print_big(1, 6, strbuf);
       OLED_print_big(1, 6 + 3 * 2, "\x7f"); //  above is 3 double cell wide
       interleave++;
       return;
     }
     case 4:
-      OLED_draw_compass(0, 0, -heading_deg);
+      OLED_draw_compass(0, 0, qmc_data.heading);
       interleave++;
       return;
     case 5: {
@@ -2980,7 +3028,7 @@ unsigned long throbStartTime;
  *         2. Initializes all external peripherals (OLED, Sensors).
  *         3. Starts the Software PWM and Sound timers.
  */
-void turn_effects_on(void) {
+void turn_effects_on() {
   // --- PIN CONFIGURATION: TAKING CONTROL ---
   // We explicitly drive the pins now.
   // Note: Pin 6 (PB1) is now forcibly taken from the Switch and given to the LED.
@@ -3008,7 +3056,7 @@ void turn_effects_on(void) {
  *         This is critical for ISP Programming safety; it ensures the ATtiny
  *         doesn't fight the programmer on the shared pins when idle.
  */
-void turn_effects_off(void) {
+void turn_effects_off() {
   // --- SHUTDOWN PERIPHERALS ---
   SSD1306_sleep();
   QMC5883P_sleep();
@@ -3043,7 +3091,7 @@ enum {
  * @desc   Runs once at power-on. Initializes communication lines to a safe state
  *         and allows power voltages to stabilize before talking to peripherals.
  */
-void setup(void) {
+void setup() {
   I2C_init(); // Set SDA/SCL to Float/High-Z ONCE to prevent bus contention
 
   // Hardware Stabilization Delay
@@ -3057,7 +3105,7 @@ void setup(void) {
  * @brief  Main Execution Loop
  * @desc   Handles the Time-Division Multiplexing logic.
  */
-void loop(void) {
+void loop() {
   /*
    * Test for device de-activation
    */
