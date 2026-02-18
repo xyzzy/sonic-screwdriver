@@ -14,5 +14,8 @@
 #undef pgm_read_word
 #define pgm_read_word(addr) (*(const uint16_t *)(addr))
 
+#undef ISR
+#define ISR(vector, ...) void vector (void)
+
 #endif
 
