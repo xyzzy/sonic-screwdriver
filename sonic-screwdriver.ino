@@ -1475,34 +1475,78 @@ bool QMC5883P_read(struct QMC5883P_data *pData) {
   return true;
 }
 
-////////////////////////////
+/*
+ * =========================================================================================
+ * BME280 ENVIRONMENTAL SENSOR SUBSYSTEM
+ * =========================================================================================
+ *
+ * 1. HARDWARE OVERVIEW
+ * -----------------------------------------------------------------------------------------
+ * - Sensor: Bosch BME280 (Temperature, Humidity, Pressure).
+ * - Interface: I2C (Address 0x76 or 0x77).
+ * - Architecture: The sensor measures raw ADC values (uncompensated). To get real
+ *   values, we must apply a complex mathematical compensation formula using
+ *   calibration data stored in the sensor's internal NVM (Non-Volatile Memory).
+ *
+ * 2. THE COMPENSATION MATH (THE "BOSCH FORMULA")
+ * -----------------------------------------------------------------------------------------
+ * The datasheet provides a specific C implementation using 32-bit integer math
+ * to avoid floating point overhead.
+ * - Temperature is calculated first to generate a global variable `t_fine`.
+ * - `t_fine` represents the "fine resolution temperature" and is REQUIRED
+ *   to compensate Pressure and Humidity.
+ * - Therefore, BME280_ReadTemp() MUST be called before reading P or H.
+ *
+ * 3. MEMORY MANAGEMENT
+ * -----------------------------------------------------------------------------------------
+ * - Calibration Data: 32 bytes of trim values are read once at startup and stored
+ *   in the global `calib` structure to save I2C bandwidth during the loop.
+ * - t_fine: Stored globally to share state between the Temperature, Pressure,
+ *   and Humidity functions.
+ *
+ * 4. REGISTER MAP SUMMARY
+ * -----------------------------------------------------------------------------------------
+ * 0x88 - 0xA1: Calibration Data Part 1 (Temp/Press + H1)
+ * 0xE1 - 0xF0: Calibration Data Part 2 (Humidity H2-H6)
+ * 0xF2:        Ctrl Humidity (Must be written BEFORE Ctrl Meas)
+ * 0xF4:        Ctrl Measure (Mode, Oversampling)
+ * 0xF7 - 0xFE: Raw ADC Data Output
+ * =========================================================================================
+ */
 
 #define BME280_ADDR         0x76 // Check your module: 0x76 (SDO=GND) or 0x77 (SDO=VCC)
 
-// Registers
-#define BME280_REG_DIG_T1   0x88 // Start of Temp Calibration
-#define BME280_REG_ID       0xD0
-#define BME280_REG_CTRL     0xF4 // Control Measurement
-#define BME280_REG_TEMP     0xFA // Temp MSB
-// Add Pressure Registers
-#define BME280_REG_DIG_P1   0x8E
-#define BME280_REG_PRESS    0xF7 // Pressure MSB
-// Add Humidity Registers
-#define BME280_REG_CTRL_HUM 0xF2
-#define BME280_REG_HUM_MSB  0xFD
+// Calibration Registers
+#define BME280_REG_DIG_T1     0x88  // Temp calibration T1 (uint16, LSB at 0x88)
+#define BME280_REG_DIG_P1     0x8E  // Pressure calibration P1 (uint16, LSB at 0x8E)
+#define BME280_REG_DIG_H1     0xA1  // Humidity calibration H1 (uint8)
+#define BME280_REG_DIG_H2     0xE1  // Humidity calibration H2 (int16, LSB at 0xE1)
 
+// Control & Status Registers
+#define BME280_REG_CTRL_HUM   0xF2  // Humidity oversampling control (osrs_h[2:0])
+#define BME280_REG_STATUS     0xF3  // Status register (measuring + NVM copy flags)
+#define BME280_REG_CTRL_MEAS  0xF4  // Temp/Press oversampling + power mode control
+#define BME280_REG_CONFIG     0xF5  // Standby time, IIR filter, SPI 3-wire enable
+
+// Data Registers
+#define BME280_REG_PRESS      0xF7  // Pressure MSB (start of 3-byte pressure data)
+#define BME280_REG_TEMP       0xFA  // Temperature MSB (start of 3-byte temp data)
+#define BME280_REG_HUM        0xFD  // Humidity MSB (start of 2-byte humidity data)
+
+// Calibration Data Structure (Trimming parameters)
 typedef struct {
-  // Temp (0x88)
+  // Temperature (0x88)
   uint16_t dig_T1;
   int16_t  dig_T2;
   int16_t  dig_T3;
+
   // Pressure (0x8E)
   uint16_t dig_P1;
   int16_t  dig_P2; int16_t  dig_P3; int16_t  dig_P4;
   int16_t  dig_P5; int16_t  dig_P6; int16_t  dig_P7;
   int16_t  dig_P8; int16_t  dig_P9;
 
-  // Humidity (Fragmented)
+  // Humidity (Fragmented Layout)
   uint8_t  dig_H1; // 0xA1
   int16_t  dig_H2; // 0xE1
   uint8_t  dig_H3; // 0xE3
@@ -1511,82 +1555,132 @@ typedef struct {
   int8_t   dig_H6; // 0xE7
 } BME280_calib_t;
 
+// Global Calibration Container
 static BME280_calib_t calib;
-static int32_t t_fine; // Needs to be static global now
 
+// Global Fine Temperature Container
+// Carries the high-res temperature value needed for Pressure/Humidity compensation.
+static int32_t t_fine;
+
+/**
+ * @brief  Initializes the BME280 Sensor.
+ * @details
+ * 1. Reads the factory calibration data (Trimming parameters).
+ * 2. Configures Oversampling (accuracy) for T, P, and H.
+ * 3. Sets the sensor to Normal Mode (continuous measurement).
+ */
 void BME280_init() {
   uint8_t buffer[26];
 
-  // --- 1. Load T/P Calibration (0x88 - 0x9F) ---
-  I2C_read(BME280_ADDR, 0x88, buffer, 24);
-  // ... [Parse T1-T3, P1-P9 as before] ...
-  calib.dig_T1 = (uint16_t)((buffer[1] << 8) | buffer[0]);
-  calib.dig_T2 = (int16_t)((buffer[3] << 8) | buffer[2]);
-  calib.dig_T3 = (int16_t)((buffer[5] << 8) | buffer[4]);
-  calib.dig_P1 = (uint16_t)((buffer[7] << 8) | buffer[6]);
-  calib.dig_P2 = (int16_t)((buffer[9] << 8) | buffer[8]);
-  calib.dig_P3 = (int16_t)((buffer[11]<< 8) | buffer[10]);
-  calib.dig_P4 = (int16_t)((buffer[13]<< 8) | buffer[12]);
-  calib.dig_P5 = (int16_t)((buffer[15]<< 8) | buffer[14]);
-  calib.dig_P6 = (int16_t)((buffer[17]<< 8) | buffer[16]);
-  calib.dig_P7 = (int16_t)((buffer[19]<< 8) | buffer[18]);
-  calib.dig_P8 = (int16_t)((buffer[21]<< 8) | buffer[20]);
-  calib.dig_P9 = (int16_t)((buffer[23]<< 8) | buffer[22]);
+  // --- 1. Load Temp/Pressure Calibration (0x88 - 0x9F) ---
+  // We read 24 bytes in one burst transaction.
+  I2C_read(BME280_ADDR, BME280_REG_DIG_T1, buffer, 24);
 
-  // --- 2. Load Humidity Calibration (Fragmented) ---
-  // H1 is alone at 0xA1
-  I2C_read(BME280_ADDR, 0xA1, &calib.dig_H1, 1);
+  // Parse Little Endian data into 16-bit integers
+  calib.dig_T1 = (uint16_t) ((buffer[1] << 8) | buffer[0]);
+  calib.dig_T2 = (int16_t) ((buffer[3] << 8) | buffer[2]);
+  calib.dig_T3 = (int16_t) ((buffer[5] << 8) | buffer[4]);
 
-  // H2-H6 are at 0xE1 to 0xE7 (7 bytes)
+  calib.dig_P1 = (uint16_t) ((buffer[7] << 8) | buffer[6]);
+  calib.dig_P2 = (int16_t) ((buffer[9] << 8) | buffer[8]);
+  calib.dig_P3 = (int16_t) ((buffer[11] << 8) | buffer[10]);
+  calib.dig_P4 = (int16_t) ((buffer[13] << 8) | buffer[12]);
+  calib.dig_P5 = (int16_t) ((buffer[15] << 8) | buffer[14]);
+  calib.dig_P6 = (int16_t) ((buffer[17] << 8) | buffer[16]);
+  calib.dig_P7 = (int16_t) ((buffer[19] << 8) | buffer[18]);
+  calib.dig_P8 = (int16_t) ((buffer[21] << 8) | buffer[20]);
+  calib.dig_P9 = (int16_t) ((buffer[23] << 8) | buffer[22]);
+
+  // --- 2. Load Humidity Calibration (Fragmented Layout) ---
+  // H1 is isolated at register 0xA1
+  I2C_read(BME280_ADDR, BME280_REG_DIG_H1, &calib.dig_H1, 1);
+
+  // H2-H6 are stored at 0xE1 to 0xE7
   uint8_t h_buff[7];
-  I2C_read(BME280_ADDR, 0xE1, h_buff, 7);
+  I2C_read(BME280_ADDR, BME280_REG_DIG_H2, h_buff, 7);
 
-  calib.dig_H2 = (int16_t)((h_buff[1] << 8) | h_buff[0]); // 0xE1-E2
-  calib.dig_H3 = h_buff[2];                               // 0xE3
+  calib.dig_H2 = (int16_t) ((h_buff[1] << 8) | h_buff[0]);// 0xE1-E2
+  calib.dig_H3 = h_buff[2];// 0xE3
 
-  // H4 is 0xE4 (MSB) + 0xE5 (lower 4 bits)
-  // FIX: Cast MSB to (int8_t) first to enforce sign extension
-  calib.dig_H4 = (int16_t)((((int8_t)h_buff[3]) << 4) | (h_buff[4] & 0x0F));
+  // H4 is stored in 0xE4 (MSB) and the lower 4 bits of 0xE5
+  // Logic: Shift MSB left 4, mask lower nibble of LSB.
+  // Explicit cast to (int8_t) ensures correct sign extension for negative values.
+  calib.dig_H4 = (int16_t) ((((int8_t) h_buff[3]) << 4) | (h_buff[4] & 0x0F));
 
-  // H5 is 0xE6 (MSB) + 0xE5 (upper 4 bits)
-  // FIX: Cast MSB to (int8_t) first
-  calib.dig_H5 = (int16_t)((((int8_t)h_buff[5]) << 4) | (h_buff[4] >> 4));
+  // H5 is stored in 0xE6 (MSB) and the upper 4 bits of 0xE5
+  // Logic: Shift MSB left 4, shift LSB right 4.
+  calib.dig_H5 = (int16_t) ((((int8_t) h_buff[5]) << 4) | (h_buff[4] >> 4));
 
-  calib.dig_H6 = (int8_t)h_buff[6]; // 0xE7 (Signed char)
+  calib.dig_H6 = (int8_t) h_buff[6];// 0xE7 (Signed char)
 
-  // --- 3. Configure (Strict Order) ---
+  // --- 3. Device Configuration (Strict Order Required) ---
 
   // Step A: Set Humidity Oversampling (x1) to Reg 0xF2
-  uint8_t ctrl_hum[] = { 0xF2, 0x01 };
+  // Note: Changes to this register only take effect after a write to Ctrl Meas (0xF4).
+  uint8_t ctrl_hum[] = {BME280_REG_CTRL_HUM, 0x01};
   I2C_write(BME280_ADDR, ctrl_hum, 2);
 
   // Step B: Set Temp/Press Oversampling + Mode to Reg 0xF4
-  // Note: Writing this register activates the changes in ctrl_hum
-  uint8_t ctrl_meas[] = { 0xF4, 0x27 }; // Normal Mode, x1 Temp, x1 Press
+  // Config: Normal Mode (11), x1 Temp (001), x1 Press (001) -> Binary: 001 001 11 -> 0x27
+  uint8_t ctrl_meas[] = {BME280_REG_CTRL_MEAS, 0x27};
   I2C_write(BME280_ADDR, ctrl_meas, 2);
 
-  // Step C: Config (Standby 1000ms)
-  uint8_t config[] = { 0xF5, 0xA0 };
+  // Step C: Set Standby Time and Filter (Reg 0xF5)
+  // Config: 1000ms Standby (101), Filter Off (000) -> 0xA0
+  uint8_t config[] = {BME280_REG_CONFIG, 0xA0};
   I2C_write(BME280_ADDR, config, 2);
 }
 
+/**
+ * @brief  Puts the BME280 into Sleep Mode (Low Power).
+ * @details In Sleep Mode, no measurements are performed.
+ *          Registers remain accessible.
+ */
 void BME280_sleep() {
   // Register 0xF4 (ctrl_meas)
-  // Mode 00 = Sleep
-  // We write 0x00 to turn off Oversampling and Mode
-  uint8_t data[] = { 0xF4, 0x00 };
+  // Mode Bits [1:0]: 00 = Sleep Mode
+  // We write 0x00 to turn off Oversampling and Mode.
+
+  uint8_t ctrl_meas;
+
+  // 1. Read current ctrl_meas register
+  I2C_read(BME280_ADDR, BME280_REG_CTRL_MEAS, &ctrl_meas, 1);
+
+  // 2. Clear mode bits [1:0] (set to 00 = Sleep)
+  ctrl_meas &= ~0x03;
+
+  // 3. Write back modified value
+  uint8_t data[2] = {BME280_REG_CTRL_MEAS, ctrl_meas};
   I2C_write(BME280_ADDR, data, 2);
 }
 
+/**
+ * @brief  Wakes the BME280 and restores measurement settings.
+ * @details Restores the configuration to x1 Oversampling and Normal Mode.
+ */
 void BME280_wake() {
-  // We do NOT need to reload calibration.
-  // Just restore the config to run a measurement.
-  // Reg 0xF4: x1 Temp (001), x1 Press (001), Normal Mode (11) -> 0x27
-  // Or Forced Mode (01) -> 0x25
-  uint8_t data[] = { 0xF4, 0x27 };
+  // We do NOT need to reload calibration data (it persists).
+  // Restore Config: x1 Temp (001), x1 Press (001), Normal Mode (11) -> 0x27
+  uint8_t ctrl_meas;
+
+  I2C_read(BME280_ADDR, BME280_REG_CTRL_MEAS, &ctrl_meas, 1);
+
+  // Clear mode bits
+  ctrl_meas &= ~0x03;
+
+  // Set mode to Normal (11)
+  ctrl_meas |= 0x03;
+
+  uint8_t data[2] = {BME280_REG_CTRL_MEAS, ctrl_meas};
   I2C_write(BME280_ADDR, data, 2);
 }
 
+/**
+ * @brief  Reads and compensates the Temperature.
+ * @note   SIDE EFFECT: Updates the global `t_fine` variable.
+ *         MUST be called before ReadPressure or ReadHumidity.
+ * @return int16_t Temperature in Degrees Celsius * 100 (e.g., "2550" = 25.50 C).
+ */
 int16_t BME280_read_temp() {
   uint8_t buffer[3];
   int32_t adc_T, var1, var2, T;
@@ -1594,26 +1688,34 @@ int16_t BME280_read_temp() {
   // 1. Read Raw ADC (FA, FB, FC)
   I2C_read(BME280_ADDR, BME280_REG_TEMP, buffer, 3);
 
-  // 2. Combine bytes (20-bit resolution)
-  // MSB << 12 | LSB << 4 | XLSB >> 4
-  adc_T = ((int32_t)buffer[0] << 12) | ((int32_t)buffer[1] << 4) | ((int32_t)buffer[2] >> 4);
+  // 2. Combine bytes into 20-bit value
+  // Layout: [MSB 8] [LSB 8] [XLSB 4] (Total 20 bits)
+  adc_T = ((int32_t) buffer[0] << 12) | ((int32_t) buffer[1] << 4) | ((int32_t) buffer[2] >> 4);
 
   // 3. Compensation Formula (Source: Bosch Datasheet)
-  // This math is unavoidable. It maps the raw ADC to actual voltage/temp curves.
+  // Calculates `var1` and `var2` based on calibration trims.
 
-  var1 = ((((adc_T >> 3) - ((int32_t)calib.dig_T1 << 1))) * ((int32_t)calib.dig_T2)) >> 11;
+  var1 = ((((adc_T >> 3) - ((int32_t) calib.dig_T1 << 1))) * ((int32_t) calib.dig_T2)) >> 11;
 
-  var2 = (((((adc_T >> 4) - ((int32_t)calib.dig_T1)) *
-	    ((adc_T >> 4) - ((int32_t)calib.dig_T1))) >> 12) *
-	  ((int32_t)calib.dig_T3)) >> 14;
+  var2 = (((((adc_T >> 4) - ((int32_t) calib.dig_T1)) *
+            ((adc_T >> 4) - ((int32_t) calib.dig_T1))) >> 12) *
+          ((int32_t) calib.dig_T3)) >> 14;
 
-  t_fine = var1 + var2; // t_fine carries the fine resolution temp for Pressure calc
+  // Update global fine temperature (used for Pressure/Hum)
+  t_fine = var1 + var2;
 
-  T = (t_fine * 5 + SSD1306_WIDTH) >> 8;
+  // Convert to readable output (Divide by 5120 as per datasheet)
+  T = (t_fine * 5 + 128) >> 8;
 
-  return (int16_t)T; // Returns temperature in degC * 100
+  // Returns temperature in degC * 100
+  return (int16_t) T;
 }
 
+/**
+ * @brief  Reads and compensates the Pressure.
+ * @note   Requires `t_fine` to be populated by `BME280_ReadTemp()` first.
+ * @return uint32_t Pressure in Pascals (Pa). e.g., 101325.
+ */
 uint32_t BME280_read_pressure() {
   uint8_t buffer[3];
   int32_t adc_P, var1, var2;
@@ -1622,63 +1724,75 @@ uint32_t BME280_read_pressure() {
   // 1. Read Raw Pressure (F7, F8, F9)
   I2C_read(BME280_ADDR, BME280_REG_PRESS, buffer, 3);
 
-  adc_P = ((int32_t)buffer[0] << 12) | ((int32_t)buffer[1] << 4) | ((int32_t)buffer[2] >> 4);
+  // Combine bytes (20-bit resolution)
+  adc_P = ((int32_t) buffer[0] << 12) | ((int32_t) buffer[1] << 4) | ((int32_t) buffer[2] >> 4);
 
-  // 2. Compensation (Bosch 32-bit formula)
-  var1 = (((int32_t)t_fine) >> 1) - (int32_t)64000;
+  // 2. Compensation (Bosch 32-bit integer formula)
+  // Uses `t_fine` (global) to adjust for temperature effects.
+  var1 = (((int32_t) t_fine) >> 1) - (int32_t) 64000;
 
-  var2 = (((var1 >> 2) * (var1 >> 2)) >> 11 ) * ((int32_t)calib.dig_P6);
-  var2 = var2 + ((var1 * ((int32_t)calib.dig_P5)) << 1);
-  var2 = (var2 >> 2) + (((int32_t)calib.dig_P4) << 16);
+  var2 = (((var1 >> 2) * (var1 >> 2)) >> 11) * ((int32_t) calib.dig_P6);
+  var2 = var2 + ((var1 * ((int32_t) calib.dig_P5)) << 1);
+  var2 = (var2 >> 2) + (((int32_t) calib.dig_P4) << 16);
 
-  var1 = (((calib.dig_P3 * (((var1 >> 2) * (var1 >> 2)) >> 13 )) >> 3) +
-	  ((((int32_t)calib.dig_P2) * var1) >> 1)) >> 18;
+  var1 = (((calib.dig_P3 * (((var1 >> 2) * (var1 >> 2)) >> 13)) >> 3) +
+          ((((int32_t) calib.dig_P2) * var1) >> 1)) >> 18;
 
-  var1 = ((((32768 + var1)) * ((int32_t)calib.dig_P1)) >> 15);
+  var1 = ((((32768 + var1)) * ((int32_t) calib.dig_P1)) >> 15);
 
-  // Division by zero protection (if P1 is empty/error)
-  if (var1 == 0) {
+  // Division by zero protection (if calibration is invalid)
+  if (var1 == 0)
     return 0;
-  }
 
-  p = (((uint32_t)(((int32_t)1048576) - adc_P) - (var2 >> 12))) * 3125;
+  // Final calculation
+  p = (((uint32_t) (((int32_t) 1048576) - adc_P) - (var2 >> 12))) * 3125;
 
+  // Overflow protection logic during the division
   if (p < 0x80000000) {
-    p = (p << 1) / ((uint32_t)var1);
+    p = (p << 1) / ((uint32_t) var1);
   } else {
-    p = (p / (uint32_t)var1) * 2;
+    p = (p / (uint32_t) var1) * 2;
   }
 
-  var1 = (((int32_t)calib.dig_P9) * ((int32_t)(((p >> 3) * (p >> 3)) >> 13))) >> 12;
-  var2 = (((int32_t)(p >> 2)) * ((int32_t)calib.dig_P8)) >> 13;
+  var1 = (((int32_t) calib.dig_P9) * ((int32_t) (((p >> 3) * (p >> 3)) >> 13))) >> 12;
+  var2 = (((int32_t) (p >> 2)) * ((int32_t) calib.dig_P8)) >> 13;
 
-  p = (uint32_t)((int32_t)p + ((var1 + var2 + calib.dig_P7) >> 4));
+  p = (uint32_t) ((int32_t) p + ((var1 + var2 + calib.dig_P7) >> 4));
 
-  return p; // Returns Pressure in Pascals (e.g., 100000)
+  // Returns Pressure in Pascals
+  return p;
 }
 
+/**
+ * @brief  Reads and compensates the Humidity.
+ * @note   Requires `t_fine` to be populated by `BME280_ReadTemp()` first.
+ * @return uint16_t Humidity in % * 100 (e.g., 4550 = 45.50%).
+ */
 uint16_t BME280_read_humidity() {
   uint8_t buffer[2];
   int32_t adc_H;
   int32_t v_x1_u32r;
 
-  // 1. Read Raw Humidity
-  I2C_read(BME280_ADDR, BME280_REG_HUM_MSB, buffer, 2);
-  adc_H = ((int32_t)buffer[0] << 8) | ((int32_t)buffer[1]);
+  // 1. Read Raw Humidity (FD, FE)
+  I2C_read(BME280_ADDR, BME280_REG_HUM, buffer, 2);
+  // Combine bytes (16-bit resolution)
+  adc_H = ((int32_t) buffer[0] << 8) | ((int32_t) buffer[1]);
 
   // 2. Compensation (Bosch Formula)
-  v_x1_u32r = (t_fine - ((int32_t)76800));
+  // Start with temperature compensation using t_fine
+  v_x1_u32r = (t_fine - ((int32_t) 76800));
 
-  v_x1_u32r = (((((adc_H << 14) - (((int32_t)calib.dig_H4) << 20) -
-		  (((int32_t)calib.dig_H5) * v_x1_u32r)) + ((int32_t)16384)) >> 15) *
-	       (((((((v_x1_u32r * ((int32_t)calib.dig_H6)) >> 10) *
-		    (((v_x1_u32r * ((int32_t)calib.dig_H3)) >> 11) + ((int32_t)32768))) >> 10) +
-		  ((int32_t)2097152)) * ((int32_t)calib.dig_H2) + 8192) >> 14));
+  // Apply calibration parameters in Q22.10 Fixed Point format
+  v_x1_u32r = (((((adc_H << 14) - (((int32_t) calib.dig_H4) << 20) -
+                  (((int32_t) calib.dig_H5) * v_x1_u32r)) + ((int32_t) 16384)) >> 15) *
+               (((((((v_x1_u32r * ((int32_t) calib.dig_H6)) >> 10) *
+                    (((v_x1_u32r * ((int32_t) calib.dig_H3)) >> 11) + ((int32_t) 32768))) >> 10) +
+                  ((int32_t) 2097152)) * ((int32_t) calib.dig_H2) + 8192) >> 14));
 
   v_x1_u32r = (v_x1_u32r - (((((v_x1_u32r >> 15) * (v_x1_u32r >> 15)) >> 7) *
-			     ((int32_t)calib.dig_H1)) >> 4));
+                             ((int32_t) calib.dig_H1)) >> 4));
 
-  // Clamp to 0..100% range in standard Q22 format
+  // Clamp result to 0..100% range in Q22 format
   if (v_x1_u32r < 0) v_x1_u32r = 0;
   if (v_x1_u32r > 419430400) v_x1_u32r = 419430400;
 
@@ -1686,10 +1800,11 @@ uint16_t BME280_read_humidity() {
   // Logic: (Value >> 12) gets us the 1024-scale.
   // Multiply by 25 and divide by 256 (>>8) converts 1024 -> 100.
 
-  uint32_t raw_1024 = (uint32_t)(v_x1_u32r >> 12);
+  uint32_t raw_1024 = (uint32_t) (v_x1_u32r >> 12);
   uint32_t final_h = (raw_1024 * 25) >> 8;
 
-  return (uint16_t)final_h; // Returns 0 to 10000
+  // Returns 0 to 10000 (100.00%)
+  return (uint16_t) final_h;
 }
 
 /* =========================================================================
