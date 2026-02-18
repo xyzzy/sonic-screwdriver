@@ -13,7 +13,7 @@ add_compile_definitions(
 	F_CPU=8000000L
 )
 
-add_library(arduino_dummy STATIC dummy.cpp sonic-screwdriver.ino)
+add_library(arduino_dummy STATIC clion_dummy.cpp sonic-screwdriver.ino)
 
 target_include_directories(arduino_dummy PRIVATE
 	/usr/share/arduino/avr/include

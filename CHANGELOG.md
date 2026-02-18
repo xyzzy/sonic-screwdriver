@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 ## [Unreleased]
 
 ```
+2026-02-18 14:52:53 Added readme+license.
 2026-02-16 11:47:10 Updated BME280 wake/sleep and comments.
 2026-02-16 11:42:16 Fixed and stabilised compass sensitivity.
 2026-02-15 22:54:25 Renamed functions/variables, spacing. no code change.
