@@ -1,4 +1,6 @@
-# ATtiny85 Sonic Screwdriver: A Bare-Metal Masterclass
+# Sonic Screwdriver on an ATtiny85
+
+*Commissioned by Otto Zegers, who designed and built the screwdriver. Firmware and electronics by xyzzy.*
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg) ![Platform: ATtiny85](https://img.shields.io/badge/Platform-ATtiny85-orange.svg) ![Constraint: 8KB Flash](https://img.shields.io/badge/Constraint-8KB_Flash-red.svg) ![Constraint: 512B RAM](https://img.shields.io/badge/Constraint-512B_RAM-red.svg)
 
@@ -6,7 +8,7 @@
 
 > **"It's like fitting a cathedral inside a shoebox."**
 
-This project is a fully functional "Sonic Screwdriver" prop powered by a single **ATtiny85** microcontroller. It features a 128x64 OLED display, a real-time compass, environmental sensors, synthesized audio, and a pulsing LED core.
+This is the firmware that powers Otto Zegers's Sonic Screwdriver prop: a single **ATtiny85** driving a 128x64 OLED display, a real-time compass, environmental sensors, synthesised audio and a pulsing LED core.
 
 **The Catch?** It runs on a chip with only **8KB of Flash** (Code) and **512 Bytes of RAM** (Memory). To make this possible, standard libraries were abandoned in favor of "Bare Metal" C++ drivers, integer mathematics, and hardware multiplexing.
 
